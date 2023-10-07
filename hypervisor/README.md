@@ -1,7 +1,7 @@
 # Hypervisor Support
 
 Multiple hypervisor backends are supported. See
-[Advanced Usage](running_crosvm/advanced_usage.md#hypervisor) for overriding the default backend.
+[Advanced Usage](https://github.com/google/crosvm/blob/main/docs/book/src/running_crosvm/advanced_usage.md#hypervisor) for overriding the default backend.
 
 Hypervisors added to crosvm must meet the following requirements:
 
