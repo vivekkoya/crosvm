@@ -2,15 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![allow(deprecated)]
-
 use std::collections::hash_map::Entry;
 use std::collections::hash_map::HashMap;
 use std::collections::hash_map::VacantEntry;
 use std::env::set_var;
 use std::fs::File;
-use std::io::IoSlice;
-use std::io::IoSliceMut;
 use std::io::Write;
 use std::mem::transmute;
 use std::os::unix::net::UnixDatagram;
@@ -22,6 +18,7 @@ use std::sync::RwLock;
 use std::thread::JoinHandle;
 
 use base::error;
+use base::linux::SharedMemoryLinux;
 use base::AsRawDescriptor;
 use base::Error as SysError;
 use base::Event;
@@ -31,10 +28,8 @@ use base::MemoryMappingBuilder;
 use base::Result as SysResult;
 use base::ScmSocket;
 use base::SharedMemory;
-use base::SharedMemoryUnix;
 use base::SIGRTMIN;
-// Wrapper types to make the kvm state structs DataInit
-use data_model::DataInit;
+use data_model::zerocopy_from_slice;
 use kvm::dirty_log_bitmap_size;
 use kvm::Datamatch;
 use kvm::IoeventAddress;
@@ -42,10 +37,6 @@ use kvm::IrqRoute;
 use kvm::IrqSource;
 use kvm::PicId;
 use kvm::Vm;
-use kvm_sys::kvm_clock_data;
-use kvm_sys::kvm_ioapic_state;
-use kvm_sys::kvm_pic_state;
-use kvm_sys::kvm_pit_state2;
 use libc::pid_t;
 use libc::waitpid;
 use libc::EINVAL;
@@ -64,37 +55,20 @@ use protobuf::Message;
 use protos::plugin::*;
 use sync::Mutex;
 use vm_memory::GuestAddress;
+use zerocopy::AsBytes;
 
 use super::*;
-#[derive(Copy, Clone)]
-struct VmPicState(kvm_pic_state);
-unsafe impl DataInit for VmPicState {}
-#[derive(Copy, Clone)]
-struct VmIoapicState(kvm_ioapic_state);
-unsafe impl DataInit for VmIoapicState {}
-#[derive(Copy, Clone)]
-struct VmPitState(kvm_pit_state2);
-unsafe impl DataInit for VmPitState {}
-#[derive(Copy, Clone)]
-struct VmClockState(kvm_clock_data);
-unsafe impl DataInit for VmClockState {}
 
 const CROSVM_SOCKET_ENV: &str = "CROSVM_SOCKET";
 
 fn get_vm_state(vm: &Vm, state_set: EnumOrUnknown<main_request::StateSet>) -> SysResult<Vec<u8>> {
     Ok(
         match state_set.enum_value().map_err(|_| SysError::new(EINVAL))? {
-            main_request::StateSet::PIC0 => VmPicState(vm.get_pic_state(PicId::Primary)?)
-                .as_slice()
-                .to_vec(),
-            main_request::StateSet::PIC1 => VmPicState(vm.get_pic_state(PicId::Secondary)?)
-                .as_slice()
-                .to_vec(),
-            main_request::StateSet::IOAPIC => {
-                VmIoapicState(vm.get_ioapic_state()?).as_slice().to_vec()
-            }
-            main_request::StateSet::PIT => VmPitState(vm.get_pit_state()?).as_slice().to_vec(),
-            main_request::StateSet::CLOCK => VmClockState(vm.get_clock()?).as_slice().to_vec(),
+            main_request::StateSet::PIC0 => vm.get_pic_state(PicId::Primary)?.as_bytes().to_vec(),
+            main_request::StateSet::PIC1 => vm.get_pic_state(PicId::Secondary)?.as_bytes().to_vec(),
+            main_request::StateSet::IOAPIC => vm.get_ioapic_state()?.as_bytes().to_vec(),
+            main_request::StateSet::PIT => vm.get_pit_state()?.as_bytes().to_vec(),
+            main_request::StateSet::CLOCK => vm.get_clock()?.as_bytes().to_vec(),
         },
     )
 }
@@ -107,31 +81,21 @@ fn set_vm_state(
     match state_set.enum_value().map_err(|_| SysError::new(EINVAL))? {
         main_request::StateSet::PIC0 => vm.set_pic_state(
             PicId::Primary,
-            &VmPicState::from_slice(state)
-                .ok_or(SysError::new(EINVAL))?
-                .0,
+            zerocopy_from_slice(state).ok_or(SysError::new(EINVAL))?,
         ),
         main_request::StateSet::PIC1 => vm.set_pic_state(
             PicId::Secondary,
-            &VmPicState::from_slice(state)
-                .ok_or(SysError::new(EINVAL))?
-                .0,
+            zerocopy_from_slice(state).ok_or(SysError::new(EINVAL))?,
         ),
-        main_request::StateSet::IOAPIC => vm.set_ioapic_state(
-            &VmIoapicState::from_slice(state)
-                .ok_or(SysError::new(EINVAL))?
-                .0,
-        ),
-        main_request::StateSet::PIT => vm.set_pit_state(
-            &VmPitState::from_slice(state)
-                .ok_or(SysError::new(EINVAL))?
-                .0,
-        ),
-        main_request::StateSet::CLOCK => vm.set_clock(
-            &VmClockState::from_slice(state)
-                .ok_or(SysError::new(EINVAL))?
-                .0,
-        ),
+        main_request::StateSet::IOAPIC => {
+            vm.set_ioapic_state(zerocopy_from_slice(state).ok_or(SysError::new(EINVAL))?)
+        }
+        main_request::StateSet::PIT => {
+            vm.set_pit_state(zerocopy_from_slice(state).ok_or(SysError::new(EINVAL))?)
+        }
+        main_request::StateSet::CLOCK => {
+            vm.set_clock(zerocopy_from_slice(state).ok_or(SysError::new(EINVAL))?)
+        }
     }
 }
 
@@ -155,7 +119,7 @@ pub enum ProcessStatus {
 pub struct Process {
     started: bool,
     plugin_pid: pid_t,
-    request_sockets: Vec<UnixDatagram>,
+    request_sockets: Vec<ScmSocket<UnixDatagram>>,
     objects: HashMap<u32, PluginObject>,
     shared_vcpu_state: Arc<RwLock<SharedVcpuState>>,
     per_vcpu_states: Vec<Arc<Mutex<PerVcpuState>>>,
@@ -238,7 +202,7 @@ impl Process {
         Ok(Process {
             started: false,
             plugin_pid,
-            request_sockets: vec![request_socket],
+            request_sockets: vec![request_socket.try_into()?],
             objects: Default::default(),
             shared_vcpu_state: Default::default(),
             per_vcpu_states,
@@ -287,7 +251,7 @@ impl Process {
     /// If any socket in this slice becomes readable, `handle_socket` should be called with the
     /// index of that socket. If any socket becomes closed, its index should be passed to
     /// `drop_sockets`.
-    pub fn sockets(&self) -> &[UnixDatagram] {
+    pub fn sockets(&self) -> &[ScmSocket<UnixDatagram>] {
         &self.request_sockets
     }
 
@@ -341,6 +305,7 @@ impl Process {
     /// Waits without blocking for the plugin process to exit and returns the status.
     pub fn try_wait(&mut self) -> SysResult<ProcessStatus> {
         let mut status = 0;
+        // SAFETY:
         // Safe because waitpid is given a valid pointer of correct size and mutability, and the
         // return value is checked.
         let ret = unsafe { waitpid(self.plugin_pid, &mut status, WNOHANG) };
@@ -541,7 +506,7 @@ impl Process {
     }
 
     fn handle_get_net_config(
-        tap: &net_util::sys::unix::Tap,
+        tap: &net_util::sys::linux::Tap,
         config: &mut main_response::GetNetConfig,
     ) -> SysResult<()> {
         // Log any NetError so that the cause can be found later, but extract and return the
@@ -582,7 +547,7 @@ impl Process {
         taps: &[Tap],
     ) -> result::Result<(), CommError> {
         let (msg_size, request_file) = self.request_sockets[index]
-            .recv_with_fd(IoSliceMut::new(&mut self.request_buffer))
+            .recv_with_file(&mut self.request_buffer)
             .map_err(io_to_sys_err)
             .map_err(CommError::PluginSocketRecv)?;
 
@@ -669,7 +634,11 @@ impl Process {
             response.mut_new_connection();
             match new_seqpacket_pair() {
                 Ok((request_socket, child_socket)) => {
-                    self.request_sockets.push(request_socket);
+                    self.request_sockets.push(
+                        request_socket
+                            .try_into()
+                            .map_err(|_| CommError::PluginSocketHup)?,
+                    );
                     response_fds.push(child_socket.as_raw_descriptor());
                     boxed_fds.push(box_owned_fd(child_socket));
                     Ok(())
@@ -681,6 +650,7 @@ impl Process {
             response_fds.push(self.kill_evt.as_raw_descriptor());
             Ok(())
         } else if request.has_check_extension() {
+            // SAFETY:
             // Safe because the Cap enum is not read by the check_extension method. In that method,
             // cap is cast back to an integer and fed to an ioctl. If the extension name is actually
             // invalid, the kernel will safely reject the extension under the assumption that the
@@ -809,7 +779,7 @@ impl Process {
             .map_err(CommError::EncodeResponse)?;
         assert_ne!(self.response_buffer.len(), 0);
         self.request_sockets[index]
-            .send_with_fds(&[IoSlice::new(&self.response_buffer[..])], &response_fds)
+            .send_with_fds(&self.response_buffer, &response_fds)
             .map_err(io_to_sys_err)
             .map_err(CommError::PluginSocketSend)?;
 

@@ -2,9 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 #![cfg(target_arch = "x86_64")]
 #![allow(non_camel_case_types)]
+#![allow(clippy::missing_safety_doc)]
 
 //! This module implements the dynamically loaded client library API used by a crosvm plugin,
 //! defined in `crosvm.h`. It implements the client half of the plugin protocol, which is defined in
@@ -19,8 +20,6 @@
 
 use std::env;
 use std::fs::File;
-use std::io::IoSlice;
-use std::io::IoSliceMut;
 use std::io::Read;
 use std::io::Write;
 use std::mem::size_of;
@@ -163,6 +162,7 @@ fn proto_error_to_int(e: protobuf::Error) -> c_int {
 }
 
 fn fd_cast<F: FromRawFd>(f: File) -> F {
+    // SAFETY:
     // Safe because we are transferring unique ownership.
     unsafe { F::from_raw_fd(f.into_raw_fd()) }
 }
@@ -271,7 +271,7 @@ fn printstats() {}
 
 pub struct crosvm {
     id_allocator: Arc<IdAllocator>,
-    socket: UnixDatagram,
+    socket: ScmSocket<UnixDatagram>,
     request_buffer: Vec<u8>,
     response_buffer: Vec<u8>,
     vcpus: Arc<[crosvm_vcpu]>,
@@ -281,7 +281,7 @@ impl crosvm {
     fn from_connection(socket: UnixDatagram) -> result::Result<crosvm, c_int> {
         let mut crosvm = crosvm {
             id_allocator: Default::default(),
-            socket,
+            socket: socket.try_into().map_err(|_| -1)?,
             request_buffer: Vec::new(),
             response_buffer: vec![0; MAX_DATAGRAM_SIZE],
             vcpus: Arc::new([]),
@@ -297,7 +297,7 @@ impl crosvm {
     ) -> crosvm {
         crosvm {
             id_allocator,
-            socket,
+            socket: socket.try_into().unwrap(),
             request_buffer: Vec::new(),
             response_buffer: vec![0; MAX_DATAGRAM_SIZE],
             vcpus,
@@ -318,26 +318,22 @@ impl crosvm {
             .write_to_vec(&mut self.request_buffer)
             .map_err(proto_error_to_int)?;
         self.socket
-            .send_with_fds(&[IoSlice::new(self.request_buffer.as_slice())], fds)
+            .send_with_fds(&self.request_buffer, fds)
             // raw_os_error is expected to be `Some` because it is constructed via
             // `std::io::Error::last_os_error()`.
             .map_err(|e| -e.raw_os_error().unwrap_or(EINVAL))?;
 
-        let mut datagram_fds = [0; MAX_DATAGRAM_FD];
-        let (msg_size, fd_count) = self
+        let (msg_size, datagram_descriptors) = self
             .socket
             .recv_with_fds(
-                IoSliceMut::new(&mut self.response_buffer),
-                &mut datagram_fds,
+                &mut self.response_buffer,
+                MAX_DATAGRAM_FD,
             )
             // raw_os_error is expected to be `Some` because it is constructed via
             // `std::io::Error::last_os_error()`.
             .map_err(|e| -e.raw_os_error().unwrap_or(EINVAL))?;
-        // Safe because the first fd_count fds from recv_with_fds are owned by us and valid.
-        let datagram_files = datagram_fds[..fd_count]
-            .iter()
-            .map(|&fd| unsafe { File::from_raw_fd(fd) })
-            .collect();
+
+        let datagram_files = datagram_descriptors.into_iter().map(File::from).collect();
 
         let response: MainResponse = Message::parse_from_bytes(&self.response_buffer[..msg_size])
             .map_err(proto_error_to_int)?;
@@ -538,14 +534,20 @@ impl crosvm {
             match route.kind {
                 CROSVM_IRQ_ROUTE_IRQCHIP => {
                     let irqchip = entry.mut_irqchip();
+                    // SAFETY:
                     // Safe because route.kind indicates which union field is valid.
                     irqchip.irqchip = unsafe { route.route.irqchip }.irqchip;
+                    // SAFETY:
+                    // Safe because route.kind indicates which union field is valid.
                     irqchip.pin = unsafe { route.route.irqchip }.pin;
                 }
                 CROSVM_IRQ_ROUTE_MSI => {
                     let msi = entry.mut_msi();
+                    // SAFETY:
                     // Safe because route.kind indicates which union field is valid.
                     msi.address = unsafe { route.route.msi }.address;
+                    // SAFETY:
+                    // Safe because route.kind indicates which union field is valid.
                     msi.data = unsafe { route.route.msi }.data;
                 }
                 _ => return Err(EINVAL),
@@ -748,7 +750,7 @@ impl crosvm_io_event {
     ) -> result::Result<crosvm_io_event, c_int> {
         let datamatch = match length {
             0 => 0,
-            1 => ptr::read_unaligned(datamatch as *const u8) as u64,
+            1 => ptr::read_unaligned(datamatch) as u64,
             2 => ptr::read_unaligned(datamatch as *const u16) as u64,
             4 => ptr::read_unaligned(datamatch as *const u32) as u64,
             8 => ptr::read_unaligned(datamatch as *const u64),

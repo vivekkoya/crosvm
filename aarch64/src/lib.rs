@@ -13,6 +13,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use arch::get_serial_cmdline;
+use arch::CpuSet;
+use arch::DtbOverlay;
 use arch::GetSerialCmdlineError;
 use arch::RunnableLinuxVm;
 use arch::VcpuAffinity;
@@ -28,6 +30,7 @@ use devices::vmwdt::VMWDT_DEFAULT_TIMEOUT_SEC;
 use devices::Bus;
 use devices::BusDeviceObj;
 use devices::BusError;
+use devices::BusType;
 use devices::IrqChip;
 use devices::IrqChipAArch64;
 use devices::IrqEventSource;
@@ -36,6 +39,7 @@ use devices::PciConfigMmio;
 use devices::PciDevice;
 use devices::PciRootCommand;
 use devices::Serial;
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtCpufreq;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
@@ -55,13 +59,13 @@ use hypervisor::VmAArch64;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
 use kernel_loader::LoadedKernel;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use minijail::Minijail;
 use remain::sorted;
 use resources::AddressRange;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -228,6 +232,8 @@ pub enum Error {
     Cmdline(kernel_cmdline::Error),
     #[error("failed to configure CPU Frequencies: {0}")]
     CpuFrequencies(base::Error),
+    #[error("failed to configure CPU topology: {0}")]
+    CpuTopology(base::Error),
     #[error("unable to create battery devices: {0}")]
     CreateBatDevices(arch::DeviceRegistrationError),
     #[error("unable to make an Event: {0}")]
@@ -392,7 +398,10 @@ impl arch::LinuxArch for AArch64 {
         dump_device_tree_blob: Option<PathBuf>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(unix)] _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] _guest_suspended_cvar: Option<
+            Arc<(Mutex<bool>, Condvar)>,
+        >,
+        device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmAArch64,
@@ -530,10 +539,10 @@ impl arch::LinuxArch for AArch64 {
             }
         }
 
-        let mmio_bus = Arc::new(devices::Bus::new());
+        let mmio_bus = Arc::new(devices::Bus::new(BusType::Mmio));
 
         // ARM doesn't really use the io bus like x86, so just create an empty bus.
-        let io_bus = Arc::new(devices::Bus::new());
+        let io_bus = Arc::new(devices::Bus::new(BusType::Io));
 
         // Event used by PMDevice to notify crosvm that
         // guest OS is trying to suspend.
@@ -552,6 +561,8 @@ impl arch::LinuxArch for AArch64 {
                 pci_devices,
                 irq_chip.as_irq_chip_mut(),
                 mmio_bus.clone(),
+                GuestAddress(AARCH64_PCI_CFG_BASE),
+                8,
                 io_bus.clone(),
                 system_allocator,
                 &mut vm,
@@ -572,14 +583,16 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
             .collect();
-        let (platform_devices, mut platform_pid_debug_label_map) =
-            arch::sys::unix::generate_platform_bus(
+        let (platform_devices, mut platform_pid_debug_label_map, dev_resources) =
+            arch::sys::linux::generate_platform_bus(
                 platform_devices,
                 irq_chip.as_irq_chip_mut(),
                 &mmio_bus,
                 system_allocator,
+                &mut vm,
                 #[cfg(feature = "swap")]
                 swap_controller,
+                components.hv_cfg.protection_type,
             )
             .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
@@ -621,6 +634,7 @@ impl arch::LinuxArch for AArch64 {
             .insert(pci_bus, AARCH64_PCI_CFG_BASE, AARCH64_PCI_CFG_SIZE)
             .map_err(Error::RegisterPci)?;
 
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         if !components.cpu_frequencies.is_empty() {
             for vcpu in 0..vcpu_count {
                 let vcpu_affinity = match components.vcpu_affinity.clone() {
@@ -686,7 +700,7 @@ impl arch::LinuxArch for AArch64 {
 
                 // a dummy AML buffer. Aarch64 crosvm doesn't use ACPI.
                 let mut amls = Vec::new();
-                let (control_tube, mmio_base) = arch::sys::unix::add_goldfish_battery(
+                let (control_tube, mmio_base) = arch::sys::linux::add_goldfish_battery(
                     &mut amls,
                     bat_jail,
                     &mmio_bus,
@@ -721,6 +735,7 @@ impl arch::LinuxArch for AArch64 {
             pci_irqs,
             pci_cfg,
             &pci_ranges,
+            dev_resources,
             vcpu_count as u32,
             components.cpu_clusters,
             components.cpu_capacity,
@@ -744,6 +759,7 @@ impl arch::LinuxArch for AArch64 {
             dump_device_tree_blob,
             &|writer, phandles| vm.create_fdt(writer, phandles),
             components.dynamic_power_coefficient,
+            device_tree_overlays,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -818,6 +834,33 @@ impl arch::LinuxArch for AArch64 {
                 .enumerate()
                 .collect(),
         )
+    }
+
+    // Returns a (cpu_id -> value) map of the DMIPS/MHz capacities of logical cores
+    // in the host system.
+    fn get_host_cpu_capacity() -> std::result::Result<BTreeMap<usize, u32>, Self::Error> {
+        Ok(Self::collect_for_each_cpu(base::logical_core_capacity)
+            .map_err(Error::CpuTopology)?
+            .into_iter()
+            .enumerate()
+            .collect())
+    }
+
+    // Creates CPU cluster mask for each CPU in the host system.
+    fn get_host_cpu_clusters() -> std::result::Result<Vec<CpuSet>, Self::Error> {
+        let cluster_ids = Self::collect_for_each_cpu(base::logical_core_cluster_id)
+            .map_err(Error::CpuTopology)?;
+        Ok(cluster_ids
+            .iter()
+            .map(|&vcpu_cluster_id| {
+                cluster_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &cpu_cluster_id)| vcpu_cluster_id == cpu_cluster_id)
+                    .map(|(cpu_id, _)| cpu_id)
+                    .collect()
+            })
+            .collect())
     }
 }
 

@@ -18,11 +18,9 @@ use base::PunchHole;
 use base::RawDescriptor;
 use base::WriteZeroesAt;
 use thiserror::Error as ThisError;
-use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::OVERLAPPED;
 
 use crate::common_executor::RawExecutor;
-use crate::io_source::AllocateMode;
 use crate::mem::BackingMemory;
 use crate::mem::MemRegion;
 use crate::sys::windows::handle_executor::HandleReactor;
@@ -107,40 +105,30 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
     }
 }
 
-fn create_overlapped(offset: Option<u64>) -> OVERLAPPED {
-    let mut overlapped = OVERLAPPED::default();
-    if let Some(offset) = offset {
-        // Safe because overlapped is allocated, and we are manipulating non-overlapping fields.
-        unsafe {
-            overlapped.u.s_mut().Offset = (offset & 0xffffffff) as DWORD;
-            overlapped.u.s_mut().OffsetHigh = (offset >> 32) as DWORD;
-        }
-    }
-    overlapped
-}
-
+/// SAFETY:
 /// Safety requirements:
-///     Same as base::platform::read_file.
+///     Same as base::windows::read_file.
 unsafe fn read(
     file: RawDescriptor,
     buf: *mut u8,
     buf_len: usize,
     overlapped: &mut OVERLAPPED,
 ) -> AsyncResult<()> {
-    base::platform::read_file(&Descriptor(file), buf, buf_len, Some(overlapped))
+    base::windows::read_file(&Descriptor(file), buf, buf_len, Some(overlapped))
         .map(|_len| ())
         .map_err(|e| AsyncError::OverlappedSource(Error::StdIoReadError(e)))
 }
 
+/// SAFETY:
 /// Safety requirements:
-///     Same as base::platform::write_file.
+///     Same as base::windows::write_file.
 unsafe fn write(
     file: RawDescriptor,
     buf: *const u8,
     buf_len: usize,
     overlapped: &mut OVERLAPPED,
 ) -> AsyncResult<()> {
-    base::platform::write_file(&Descriptor(file), buf, buf_len, Some(overlapped))
+    base::windows::write_file(&Descriptor(file), buf, buf_len, Some(overlapped))
         .map(|_len| ())
         .map_err(|e| AsyncError::OverlappedSource(Error::StdIoWriteError(e)))
 }
@@ -157,9 +145,9 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
                 io::Error::new(io::ErrorKind::InvalidInput, "seek on non-seekable handle"),
             )));
         }
-        let overlapped = create_overlapped(file_offset);
-        let mut overlapped_op = self.reg_source.register_overlapped_operation(overlapped)?;
+        let mut overlapped_op = self.reg_source.register_overlapped_operation(file_offset)?;
 
+        // SAFETY:
         // Safe because we pass a pointer to a valid vec and that same vector's length.
         unsafe {
             read(
@@ -198,13 +186,13 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
         };
 
         for region in mem_offsets.into_iter() {
-            let overlapped = create_overlapped(offset);
-            let mut overlapped_op = self.reg_source.register_overlapped_operation(overlapped)?;
+            let mut overlapped_op = self.reg_source.register_overlapped_operation(offset)?;
 
             let slice = mem.get_volatile_slice(region).map_err(|e| {
                 AsyncError::OverlappedSource(Error::BackingMemoryVolatileSliceFetchFailed(e))
             })?;
 
+            // SAFETY:
             // Safe because we're passing a volatile slice (valid ptr), and the size of the memory region it refers to.
             unsafe {
                 read(
@@ -245,9 +233,9 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
                 io::Error::new(io::ErrorKind::InvalidInput, "seek on non-seekable handle"),
             )));
         }
-        let overlapped = create_overlapped(file_offset);
-        let mut overlapped_op = self.reg_source.register_overlapped_operation(overlapped)?;
+        let mut overlapped_op = self.reg_source.register_overlapped_operation(file_offset)?;
 
+        // SAFETY:
         // Safe because we pass a pointer to a valid vec and that same vector's length.
         unsafe {
             write(
@@ -287,13 +275,13 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
         };
 
         for region in mem_offsets.into_iter() {
-            let overlapped = create_overlapped(offset);
-            let mut overlapped_op = self.reg_source.register_overlapped_operation(overlapped)?;
+            let mut overlapped_op = self.reg_source.register_overlapped_operation(offset)?;
 
             let slice = mem.get_volatile_slice(region).map_err(|e| {
                 AsyncError::OverlappedSource(Error::BackingMemoryVolatileSliceFetchFailed(e))
             })?;
 
+            // SAFETY:
             // Safe because we're passing a volatile slice (valid ptr), and the size of the memory region it refers to.
             unsafe {
                 write(
@@ -313,16 +301,11 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
         Ok(total_bytes_written)
     }
 
-    /// See `fallocate(2)`. Note this op is synchronous when using the Polled backend.
+    /// Deallocates the given range of a file.
     ///
     /// TODO(nkgold): currently this is sync on the executor, which is bad / very hacky. With a
     /// little wrapper work, we can make overlapped DeviceIoControl calls instead.
-    pub async fn fallocate(
-        &self,
-        file_offset: u64,
-        len: u64,
-        mode: AllocateMode,
-    ) -> AsyncResult<()> {
+    pub async fn punch_hole(&self, file_offset: u64, len: u64) -> AsyncResult<()> {
         if self.seek_forbidden {
             return Err(AsyncError::OverlappedSource(Error::IoSeekError(
                 io::Error::new(
@@ -331,27 +314,44 @@ impl<F: AsRawDescriptor> OverlappedSource<F> {
                 ),
             )));
         }
+        // SAFETY:
+        // Safe because self.source lives as long as file.
+        let file = ManuallyDrop::new(unsafe {
+            File::from_raw_descriptor(self.source.as_raw_descriptor())
+        });
+        file.punch_hole(file_offset, len)
+            .map_err(|e| AsyncError::OverlappedSource(Error::IoPunchHoleError(e)))?;
+        Ok(())
+    }
+
+    /// Fills the given range with zeroes.
+    ///
+    /// TODO(nkgold): currently this is sync on the executor, which is bad / very hacky. With a
+    /// little wrapper work, we can make overlapped DeviceIoControl calls instead.
+    pub async fn write_zeroes_at(&self, file_offset: u64, len: u64) -> AsyncResult<()> {
+        if self.seek_forbidden {
+            return Err(AsyncError::OverlappedSource(Error::IoSeekError(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "write_zeroes_at cannot be called on a non-seekable handle",
+                ),
+            )));
+        }
+        // SAFETY:
         // Safe because self.source lives as long as file.
         let mut file = ManuallyDrop::new(unsafe {
             File::from_raw_descriptor(self.source.as_raw_descriptor())
         });
-        match mode {
-            AllocateMode::PunchHole => {
-                file.punch_hole(file_offset, len)
-                    .map_err(|e| AsyncError::OverlappedSource(Error::IoPunchHoleError(e)))?;
-            }
-            // ZeroRange calls `punch_hole` which doesn't extend the File size if it needs to.
-            // Will fix if it becomes a problem.
-            AllocateMode::ZeroRange => {
-                file.write_zeroes_at(file_offset, len as usize)
-                    .map_err(|e| AsyncError::OverlappedSource(Error::IoWriteZeroesError(e)))?;
-            }
-        }
+        // ZeroRange calls `punch_hole` which doesn't extend the File size if it needs to.
+        // Will fix if it becomes a problem.
+        file.write_zeroes_at(file_offset, len as usize)
+            .map_err(|e| AsyncError::OverlappedSource(Error::IoWriteZeroesError(e)))?;
         Ok(())
     }
 
     /// Sync all completed write operations to the backing storage.
     pub async fn fsync(&self) -> AsyncResult<()> {
+        // SAFETY:
         // Safe because self.source lives at least as long as the blocking pool thread. Note that
         // if the blocking pool stalls and shutdown fails, the thread could outlive the file;
         // however, this would mean things are already badly broken and we have a similar risk in
@@ -567,9 +567,7 @@ mod tests {
         async fn punch_hole(src: &OverlappedSource<File>) {
             let offset = 1;
             let len = 3;
-            src.fallocate(offset, len, AllocateMode::PunchHole)
-                .await
-                .unwrap();
+            src.punch_hole(offset, len).await.unwrap();
         }
 
         let ex = RawExecutor::<HandleReactor>::new().unwrap();
@@ -600,9 +598,7 @@ mod tests {
         async fn punch_hole(src: &OverlappedSource<File>) {
             let offset = 9;
             let len = 4;
-            src.fallocate(offset, len, AllocateMode::PunchHole)
-                .await
-                .unwrap();
+            src.punch_hole(offset, len).await.unwrap();
         }
 
         let ex = RawExecutor::<HandleReactor>::new().unwrap();

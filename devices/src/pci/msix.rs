@@ -22,7 +22,10 @@ use vm_control::VmIrqRequest;
 use vm_control::VmIrqResponse;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
+use crate::pci::pci_configuration::PciCapConfig;
+use crate::pci::pci_configuration::PciCapConfigWriteResult;
 use crate::pci::PciCapability;
 use crate::pci::PciCapabilityID;
 
@@ -108,11 +111,14 @@ pub enum MsixError {
 
 type MsixResult<T> = std::result::Result<T, MsixError>;
 
+#[derive(Copy, Clone)]
 pub enum MsixStatus {
     Changed,
     EntryChanged(usize),
     NothingToDo,
 }
+
+impl PciCapConfigWriteResult for MsixStatus {}
 
 impl MsixConfig {
     pub fn new(msix_vectors: u16, vm_socket: Tube, pci_id: u32, device_name: String) -> Self {
@@ -706,6 +712,36 @@ impl MsixConfig {
     }
 }
 
+const MSIX_CONFIG_READ_MASK: [u32; 3] = [0xc000_0000, 0, 0];
+
+impl PciCapConfig for MsixConfig {
+    fn read_mask(&self) -> &'static [u32] {
+        &MSIX_CONFIG_READ_MASK
+    }
+
+    fn read_reg(&self, reg_idx: usize) -> u32 {
+        if reg_idx == 0 {
+            self.read_msix_capability(0)
+        } else {
+            0
+        }
+    }
+
+    fn write_reg(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Box<dyn PciCapConfigWriteResult>> {
+        let status = if reg_idx == 0 {
+            self.write_msix_capability(offset, data)
+        } else {
+            MsixStatus::NothingToDo
+        };
+        Some(Box::new(status))
+    }
+}
+
 impl AsRawDescriptor for MsixConfig {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.msi_device_socket.as_raw_descriptor()
@@ -719,7 +755,7 @@ impl AsRawDescriptor for MsixConfig {
 //   15:    Enable. Enable all MSI-X when set.
 // See <https://wiki.osdev.org/PCI#Enabling_MSI-X> for the details.
 #[bitfield]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 pub struct MsixCtrl {
     table_size: B10,
     reserved: B4,
@@ -729,7 +765,7 @@ pub struct MsixCtrl {
 
 #[allow(dead_code)]
 #[repr(C)]
-#[derive(Clone, Copy, Default, AsBytes, FromBytes)]
+#[derive(Clone, Copy, Default, AsBytes, FromZeroes, FromBytes)]
 /// MSI-X Capability Structure
 pub struct MsixCap {
     // To make add_capability() happy

@@ -6,11 +6,15 @@
 
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
+use crate::pci::pci_configuration::PciCapConfig;
+use crate::pci::pci_configuration::PciCapConfigWriteResult;
+use crate::pci::pci_configuration::PciCapMapping;
 use crate::pci::PciCapability;
 use crate::pci::PciCapabilityID;
 
-pub const PM_CAP_CONTROL_STATE_OFFSET: usize = 1;
+const PM_CAP_CONTROL_STATE_OFFSET: usize = 1;
 pub const PM_CAP_LENGTH: usize = 8;
 const PM_CAP_PME_SUPPORT_D0: u16 = 0x0800;
 const PM_CAP_PME_SUPPORT_D3_HOT: u16 = 0x4000;
@@ -18,6 +22,7 @@ const PM_CAP_PME_SUPPORT_D3_COLD: u16 = 0x8000;
 const PM_CAP_VERSION: u16 = 0x2;
 const PM_PME_STATUS: u16 = 0x8000;
 const PM_PME_ENABLE: u16 = 0x100;
+const PM_NO_SOFT_RESET: u16 = 0x8;
 const PM_POWER_STATE_MASK: u16 = 0x3;
 const PM_POWER_STATE_D0: u16 = 0;
 const PM_POWER_STATE_D3: u16 = 0x3;
@@ -30,7 +35,7 @@ pub enum PciDevicePower {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, AsBytes, FromBytes)]
+#[derive(Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 pub struct PciPmCap {
     _cap_vndr: u8,
     _cap_next: u8,
@@ -73,12 +78,14 @@ impl PciPmCap {
 
 pub struct PmConfig {
     power_control_status: u16,
+    cap_mapping: Option<PciCapMapping>,
 }
 
 impl PmConfig {
-    pub fn new() -> Self {
+    pub fn new(no_soft_reset: bool) -> Self {
         PmConfig {
-            power_control_status: 0,
+            power_control_status: if no_soft_reset { PM_NO_SOFT_RESET } else { 0 },
+            cap_mapping: None,
         }
     }
 
@@ -125,7 +132,13 @@ impl PmConfig {
             && self.power_control_status & PM_PME_ENABLE != 0
         {
             self.power_control_status |= PM_PME_STATUS;
-
+            if let Some(cap_mapping) = &mut self.cap_mapping {
+                cap_mapping.set_reg(
+                    PM_CAP_CONTROL_STATE_OFFSET,
+                    self.power_control_status as u32,
+                    0xffff,
+                );
+            }
             return true;
         }
 
@@ -139,5 +152,49 @@ impl PmConfig {
             PM_POWER_STATE_D3 => PciDevicePower::D3,
             _ => PciDevicePower::Unsupported,
         }
+    }
+}
+
+pub struct PmStatusChange {
+    pub from: PciDevicePower,
+    pub to: PciDevicePower,
+}
+
+impl PciCapConfigWriteResult for PmStatusChange {}
+
+const PM_CONFIG_READ_MASK: [u32; 2] = [0, 0xffff];
+
+impl PciCapConfig for PmConfig {
+    fn read_mask(&self) -> &'static [u32] {
+        &PM_CONFIG_READ_MASK
+    }
+
+    fn read_reg(&self, reg_idx: usize) -> u32 {
+        let mut data = 0;
+        if reg_idx == PM_CAP_CONTROL_STATE_OFFSET {
+            self.read(&mut data);
+        }
+        data
+    }
+
+    fn write_reg(
+        &mut self,
+        reg_idx: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Box<dyn PciCapConfigWriteResult>> {
+        if reg_idx == PM_CAP_CONTROL_STATE_OFFSET {
+            let from = self.get_power_status();
+            self.write(offset, data);
+            let to = self.get_power_status();
+            if from != to {
+                return Some(Box::new(PmStatusChange { from, to }));
+            }
+        }
+        None
+    }
+
+    fn set_cap_mapping(&mut self, mapping: PciCapMapping) {
+        self.cap_mapping = Some(mapping);
     }
 }

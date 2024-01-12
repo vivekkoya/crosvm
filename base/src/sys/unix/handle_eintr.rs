@@ -15,7 +15,7 @@ pub trait InterruptibleResult {
     fn is_interrupted(&self) -> bool;
 }
 
-impl<T> InterruptibleResult for super::Result<T> {
+impl<T> InterruptibleResult for crate::Result<T> {
     fn is_interrupted(&self) -> bool {
         matches!(self, Err(e) if e.errno() == EINTR)
     }
@@ -33,7 +33,7 @@ impl<T> InterruptibleResult for io::Result<T> {
 ///
 /// The given expression `$x` can return
 ///
-/// * `crate::platform::Result` in which case the expression is retried if the `Error::errno()` is `EINTR`.
+/// * `crate::linux::Result` in which case the expression is retried if the `Error::errno()` is `EINTR`.
 /// * `std::io::Result` in which case the expression is retried if the `ErrorKind` is `ErrorKind::Interrupted`.
 ///
 /// Note that if expression returns i32 (i.e. either -1 or error code), then handle_eintr_errno()
@@ -115,7 +115,7 @@ impl<T> InterruptibleResult for io::Result<T> {
 #[macro_export]
 macro_rules! handle_eintr {
     ($x:expr) => {{
-        use $crate::platform::handle_eintr::InterruptibleResult;
+        use $crate::unix::handle_eintr::InterruptibleResult;
         let res;
         loop {
             match $x {
@@ -157,7 +157,7 @@ macro_rules! handle_eintr_rc {
 macro_rules! handle_eintr_errno {
     ($x:expr) => {{
         use libc::EINTR;
-        use $crate::platform::Error;
+        use $crate::Error;
         let mut res;
         loop {
             res = $x;
@@ -171,8 +171,8 @@ macro_rules! handle_eintr_errno {
 
 #[cfg(test)]
 mod tests {
-    use super::super::Error as SysError;
     use super::*;
+    use crate::Error as SysError;
 
     // Sets errno to the given error code.
     fn set_errno(e: i32) {
@@ -184,7 +184,12 @@ mod tests {
         unsafe fn errno_location() -> *mut libc::c_int {
             libc::__errno_location()
         }
+        #[cfg(target_os = "macos")]
+        unsafe fn errno_location() -> *mut libc::c_int {
+            libc::__error()
+        }
 
+        // SAFETY: trivially safe
         unsafe {
             *errno_location() = e;
         }

@@ -6,7 +6,6 @@ mod sys;
 pub(crate) mod worker;
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use base::error;
 use base::info;
@@ -24,14 +23,14 @@ use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::message::VhostUserShmemMapMsg;
 use vmm_vhost::message::VhostUserShmemUnmapMsg;
 use vmm_vhost::HandlerResult;
+use vmm_vhost::Master;
 use vmm_vhost::MasterReqHandler;
-use vmm_vhost::VhostUserMasterReqHandlerMut;
+use vmm_vhost::VhostUserMasterReqHandler;
 use vmm_vhost::VhostUserMemoryRegionInfo;
 use vmm_vhost::VringConfigData;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
 use crate::virtio::vhost::user::vmm::handler::sys::create_backend_req_handler;
-use crate::virtio::vhost::user::vmm::handler::sys::SocketMaster;
 use crate::virtio::vhost::user::vmm::Connection;
 use crate::virtio::vhost::user::vmm::Error;
 use crate::virtio::vhost::user::vmm::Result;
@@ -40,10 +39,10 @@ use crate::virtio::Queue;
 use crate::virtio::SharedMemoryMapper;
 use crate::virtio::SharedMemoryRegion;
 
-type BackendReqHandler = MasterReqHandler<Mutex<BackendReqHandlerImpl>>;
+type BackendReqHandler = MasterReqHandler<BackendReqHandlerImpl>;
 
 pub struct VhostUserHandler {
-    vu: SocketMaster,
+    vu: Master,
     pub avail_features: u64,
     acked_features: u64,
     protocol_features: VhostUserProtocolFeatures,
@@ -62,7 +61,7 @@ impl VhostUserHandler {
         #[cfg(windows)]
         let backend_pid = connection.target_pid();
 
-        let mut vu = SocketMaster::from_stream(connection);
+        let mut vu = Master::from_stream(connection);
 
         vu.set_owner().map_err(Error::SetOwner)?;
 
@@ -331,9 +330,7 @@ impl VhostUserHandler {
             .id;
 
         backend_req_handler
-            .backend()
-            .lock()
-            .unwrap()
+            .backend_mut()
             .set_shared_mapper_state(SharedMapperState { mapper, shmid });
         Ok(())
     }
@@ -358,7 +355,11 @@ impl VhostUserHandler {
 
     /// Sends a restore request with a payload of serialized snapshotted data and queue_evts to the
     /// device process so that it can revive its state and wire up the queue_evts again.
-    pub fn restore(&self, data: serde_json::Value, queue_evts: Option<Vec<Event>>) -> Result<()> {
+    pub fn restore(
+        &mut self,
+        data: serde_json::Value,
+        queue_evts: Option<Vec<Event>>,
+    ) -> Result<()> {
         let data_bytes: Vec<u8> = serde_json::from_value(data).map_err(Error::SerdeValueToSlice)?;
         self.vu
             .restore(data_bytes.as_slice(), queue_evts)
@@ -384,14 +385,10 @@ impl VhostUserHandler {
     ) -> Result<WorkerThread<()>> {
         let label = format!("vhost_user_virtio_{}", label);
 
-        let backend_req_handler = self.backend_req_handler.take();
-        if let Some(handler) = &backend_req_handler {
+        let mut backend_req_handler = self.backend_req_handler.take();
+        if let Some(handler) = &mut backend_req_handler {
             // Using unwrap here to get the mutex protected value
-            handler
-                .backend()
-                .lock()
-                .unwrap()
-                .set_interrupt(interrupt.clone());
+            handler.backend_mut().set_interrupt(interrupt.clone());
         }
 
         Ok(WorkerThread::start(label.clone(), move |kill_evt| {
@@ -429,7 +426,7 @@ impl BackendReqHandlerImpl {
     }
 }
 
-impl VhostUserMasterReqHandlerMut for BackendReqHandlerImpl {
+impl VhostUserMasterReqHandler for BackendReqHandlerImpl {
     fn shmem_map(
         &mut self,
         req: &VhostUserShmemMapMsg,

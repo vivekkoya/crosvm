@@ -2,15 +2,23 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 pub mod avcodec;
 mod avutil;
 pub use avutil::*;
 mod error;
 pub use error::*;
-mod ffmpeg;
-use crate::ffmpeg as ffi;
+mod ffi {
+    #![allow(clippy::missing_safety_doc)]
+    #![allow(clippy::undocumented_unsafe_blocks)]
+    #![allow(clippy::upper_case_acronyms)]
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
 pub mod swscale;
 
 pub use ffi::AVPictureType_AV_PICTURE_TYPE_I;

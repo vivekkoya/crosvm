@@ -5,15 +5,10 @@
 //! The mmap module provides a safe interface to map memory and ensures UnmapViewOfFile is called when the
 //! mmap object leaves scope.
 
-use std::io;
-use std::slice::from_raw_parts;
-use std::slice::from_raw_parts_mut;
-
-use libc::c_int;
-use libc::c_uint;
 use libc::c_void;
 use win_util::get_high_order;
 use win_util::get_low_order;
+use winapi::shared::minwindef::DWORD;
 use winapi::um::memoryapi::FlushViewOfFile;
 use winapi::um::memoryapi::MapViewOfFile;
 use winapi::um::memoryapi::MapViewOfFileEx;
@@ -22,17 +17,27 @@ use winapi::um::memoryapi::FILE_MAP_READ;
 use winapi::um::memoryapi::FILE_MAP_WRITE;
 
 use super::allocation_granularity;
-use super::mmap::Error;
 use super::mmap::MemoryMapping;
-use super::mmap::Result;
 use crate::descriptor::AsRawDescriptor;
 use crate::warn;
-use crate::MappedRegion;
+use crate::MmapError as Error;
+use crate::MmapResult as Result;
 use crate::Protection;
 use crate::RawDescriptor;
 
-pub(crate) const PROT_READ: c_int = FILE_MAP_READ as c_int;
-pub(crate) const PROT_WRITE: c_int = FILE_MAP_WRITE as c_int;
+impl From<Protection> for DWORD {
+    #[inline(always)]
+    fn from(p: Protection) -> Self {
+        let mut value = 0;
+        if p.read {
+            value |= FILE_MAP_READ;
+        }
+        if p.write {
+            value |= FILE_MAP_WRITE;
+        }
+        value
+    }
+}
 
 impl MemoryMapping {
     /// Creates an anonymous shared mapping of `size` bytes with `prot` protection.
@@ -41,6 +46,7 @@ impl MemoryMapping {
     /// * `size` - Size of memory region in bytes.
     /// * `prot` - Protection (e.g. readable/writable) of the memory region.
     pub fn new_protection(size: usize, prot: Protection) -> Result<MemoryMapping> {
+        // SAFETY:
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
         unsafe { MemoryMapping::try_mmap(None, size, prot.into(), None) }
@@ -59,6 +65,7 @@ impl MemoryMapping {
         file_handle: RawDescriptor,
         size: usize,
     ) -> Result<MemoryMapping> {
+        // SAFETY:
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
         unsafe {
@@ -84,6 +91,7 @@ impl MemoryMapping {
         offset: u64,
         prot: Protection,
     ) -> Result<MemoryMapping> {
+        // SAFETY:
         // This is safe because we are creating an anonymous mapping in a place not already used by
         // any other area in this process.
         unsafe {
@@ -144,7 +152,7 @@ impl MemoryMapping {
     unsafe fn try_mmap(
         addr: Option<*mut u8>,
         size: usize,
-        access_flags: c_uint,
+        access_flags: DWORD,
         file_handle: Option<(RawDescriptor, u64)>,
     ) -> Result<MemoryMapping> {
         if file_handle.is_none() {
@@ -193,6 +201,7 @@ impl MemoryMapping {
     /// Calls FlushViewOfFile on the mapped memory range, ensuring all changes that would
     /// be written to disk are written immediately
     pub fn msync(&self) -> Result<()> {
+        // SAFETY:
         // Safe because self can only be created as a successful memory mapping
         unsafe {
             if FlushViewOfFile(self.addr, self.size) == 0 {
@@ -201,95 +210,11 @@ impl MemoryMapping {
         };
         Ok(())
     }
-
-    /// Reads data from a file descriptor and writes it to guest memory.
-    ///
-    /// # Arguments
-    /// * `mem_offset` - Begin writing memory at this offset.
-    /// * `src` - Read from `src` to memory.
-    /// * `count` - Read `count` bytes from `src` to memory.
-    ///
-    /// # Examples
-    ///
-    /// * Read bytes from /dev/urandom
-    ///
-    /// ```
-    ///   use base::platform::MemoryMapping;
-    ///   use base::platform::SharedMemory;
-    ///   use std::ffi::CString;
-    ///   use std::fs::File;
-    ///   use std::path::Path;
-    ///   fn test_read_random() -> Result<u32, ()> {
-    ///       let mut mem_map = MemoryMapping::from_descriptor(
-    ///         &SharedMemory::new(&CString::new("test").unwrap(), 1024).unwrap(), 1024).unwrap();
-    ///       let mut file = File::open(Path::new("/dev/urandom")).map_err(|_| ())?;
-    ///       mem_map.read_to_memory(32, &mut file, 128).map_err(|_| ())?;
-    ///       let rand_val: u32 =  mem_map.read_obj(40).map_err(|_| ())?;
-    ///       Ok(rand_val)
-    ///   }
-    /// ```
-    pub fn read_to_memory<F: io::Read>(
-        &self,
-        mem_offset: usize,
-        src: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        self.range_end(mem_offset, count)
-            .map_err(|_| Error::InvalidRange(mem_offset, count, self.size()))?;
-        // Safe because the check above ensures that no memory outside this slice will get accessed
-        // by this read call.
-        let buf: &mut [u8] = unsafe { from_raw_parts_mut(self.as_ptr().add(mem_offset), count) };
-        match src.read_exact(buf) {
-            Err(e) => Err(Error::ReadToMemory(e)),
-            Ok(()) => Ok(()),
-        }
-    }
-
-    /// Writes data from memory to a file descriptor.
-    ///
-    /// # Arguments
-    /// * `mem_offset` - Begin reading memory from this offset.
-    /// * `dst` - Write from memory to `dst`.
-    /// * `count` - Read `count` bytes from memory to `src`.
-    ///
-    /// # Examples
-    ///
-    /// * Write 128 bytes to /dev/null
-    ///
-    /// ```
-    ///   use base::platform::MemoryMapping;
-    ///   use base::platform::SharedMemory;
-    ///   use std::ffi::CString;
-    ///   use std::fs::File;
-    ///   use std::path::Path;
-    ///   fn test_write_null() -> Result<(), ()> {
-    ///       let mut mem_map = MemoryMapping::from_descriptor(
-    ///           &SharedMemory::new(&CString::new("test").unwrap(), 1024).unwrap(), 1024).unwrap();
-    ///       let mut file = File::open(Path::new("/dev/null")).map_err(|_| ())?;
-    ///       mem_map.write_from_memory(32, &mut file, 128).map_err(|_| ())?;
-    ///       Ok(())
-    ///   }
-    /// ```
-    pub fn write_from_memory<F: io::Write>(
-        &self,
-        mem_offset: usize,
-        dst: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        self.range_end(mem_offset, count)
-            .map_err(|_| Error::InvalidRange(mem_offset, count, self.size()))?;
-        // Safe because the check above ensures that no memory outside this slice will get accessed
-        // by this write call.
-        let buf: &[u8] = unsafe { from_raw_parts(self.as_ptr().add(mem_offset), count) };
-        match dst.write_all(buf) {
-            Err(e) => Err(Error::WriteFromMemory(e)),
-            Ok(()) => Ok(()),
-        }
-    }
 }
 
 impl Drop for MemoryMapping {
     fn drop(&mut self) {
+        // SAFETY:
         // This is safe because we MapViewOfFile the area at addr ourselves, and nobody
         // else is holding a reference to it.
         unsafe {
@@ -307,20 +232,20 @@ pub struct MemoryMappingArena();
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use std::ptr;
 
     use winapi::shared::winerror;
 
     use super::super::pagesize;
-    use super::super::SharedMemory;
     use super::Error;
     use crate::descriptor::FromRawDescriptor;
     use crate::MappedRegion;
     use crate::MemoryMappingBuilder;
+    use crate::SharedMemory;
 
     #[test]
     fn map_invalid_fd() {
+        // SAFETY: trivially safe to create an invalid File.
         let descriptor = unsafe { std::fs::File::from_raw_descriptor(ptr::null_mut()) };
         let res = MemoryMappingBuilder::new(1024)
             .from_file(&descriptor)
@@ -338,8 +263,7 @@ mod tests {
 
     #[test]
     fn from_descriptor_offset_invalid() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
-        let shm = crate::SharedMemory(shm);
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let res = MemoryMappingBuilder::new(4096)
             .from_shared_memory(&shm)
             .offset((i64::max_value() as u64) + 1)
@@ -354,8 +278,7 @@ mod tests {
     #[test]
     fn arena_msync() {
         let size: usize = 0x40000;
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), size as u64).unwrap();
-        let shm = crate::SharedMemory(shm);
+        let shm = SharedMemory::new("test", size as u64).unwrap();
         let m = MemoryMappingBuilder::new(size)
             .from_shared_memory(&shm)
             .build()

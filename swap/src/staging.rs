@@ -8,14 +8,14 @@ use std::ops::Range;
 use std::ptr::copy_nonoverlapping;
 
 use base::error;
+use base::linux::MemoryMappingUnix;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
-use base::MemoryMappingUnix;
 use base::MmapError;
 use base::SharedMemory;
-use data_model::VolatileMemory;
-use data_model::VolatileMemoryError;
-use data_model::VolatileSlice;
+use base::VolatileMemory;
+use base::VolatileMemoryError;
+use base::VolatileSlice;
 use thiserror::Error as ThisError;
 
 use crate::pagesize::pages_to_bytes;
@@ -52,6 +52,7 @@ pub struct CopyOp {
     size: usize,
 }
 
+/// SAFETY:
 /// CopyOp is safe to be sent to other threads because:
 ///   * The source memory region (guest memory) is alive for the monitor process lifetime.
 ///   * The destination memory region (staging memory) is alive until all the [CopyOp] are executed.
@@ -61,6 +62,7 @@ unsafe impl Send for CopyOp {}
 impl CopyOp {
     /// Copies the specified the guest memory to the staging memory.
     pub fn execute(self) {
+        // SAFETY:
         // Safe because:
         // * the source memory is in guest memory and no processes access it.
         // * src_addr and dst_addr are aligned with the page size.
@@ -245,6 +247,8 @@ mod tests {
         let mut staging_memory = StagingMemory::new(&shmem, 0, 200).unwrap();
 
         let src_addr = mmap.as_ptr();
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(src_addr, 1, 4).unwrap();
             // empty
@@ -280,12 +284,16 @@ mod tests {
         let mmap = create_mmap(1, 1);
         let mut staging_memory = StagingMemory::new(&shmem, 0, 200).unwrap();
 
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(mmap.as_ptr(), 0, 1).unwrap().execute();
         }
 
         let page = staging_memory.page_content(0).unwrap().unwrap();
-        let result = unsafe { std::slice::from_raw_parts(page.as_ptr() as *const u8, page.size()) };
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
+        let result = unsafe { std::slice::from_raw_parts(page.as_ptr(), page.size()) };
         assert_eq!(result, &vec![1; pagesize()]);
     }
 
@@ -307,6 +315,8 @@ mod tests {
         let mmap = create_mmap(1, 5);
         let mut staging_memory = StagingMemory::new(&shmem, 0, 200).unwrap();
 
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(mmap.as_ptr(), 0, 5).unwrap();
         }
@@ -338,6 +348,8 @@ mod tests {
         let mut staging_memory = StagingMemory::new(&shmem, 0, 200).unwrap();
 
         let src_addr = mmap.as_ptr();
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(src_addr, 1, 2).unwrap();
             staging_memory.copy(src_addr, 3, 1).unwrap();
@@ -360,6 +372,8 @@ mod tests {
 
         let src_addr1 = mmap1.as_ptr();
         let src_addr2 = mmap2.as_ptr();
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(src_addr1, 1, 1).unwrap().execute();
             staging_memory.copy(src_addr2, 2, 1).unwrap().execute();
@@ -399,6 +413,8 @@ mod tests {
         let mut staging_memory = StagingMemory::new(&shmem, 0, 200).unwrap();
 
         let src_addr = mmap.as_ptr();
+        // TODO(b/315998194): Add safety comment
+        #[allow(clippy::undocumented_unsafe_blocks)]
         unsafe {
             staging_memory.copy(src_addr, 1, 4).unwrap();
             staging_memory.copy(src_addr, 12, 1).unwrap();

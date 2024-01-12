@@ -9,6 +9,7 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::thread::Thread;
 
+use crate::Error;
 use crate::Event;
 
 /// Wrapper object for creating a worker thread that can be stopped by signaling an event.
@@ -64,6 +65,19 @@ impl<T: Send + 'static> WorkerThread<T> {
                 Err(e) => panic::resume_unwind(e),
             }
         })
+    }
+
+    /// Signal thread's stop event. Unlike stop, the function doesn't wait
+    /// on joining the thread.
+    /// The function can be called multiple times.
+    /// Calling `stop` or `drop` will internally signal the stop event again
+    /// and join the thread.
+    pub fn signal(&mut self) -> Result<(), Error> {
+        if let Some((event, _)) = &mut self.worker {
+            event.signal()
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns a handle to the running thread.

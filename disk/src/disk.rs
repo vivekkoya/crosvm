@@ -8,7 +8,6 @@ use std::cmp::min;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io;
-use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
@@ -21,8 +20,6 @@ use base::AsRawDescriptors;
 use base::FileAllocate;
 use base::FileReadWriteAtVolatile;
 use base::FileSetLen;
-use base::PunchHole;
-use cros_async::AllocateMode;
 use cros_async::BackingMemory;
 use cros_async::Executor;
 use cros_async::IoSource;
@@ -67,6 +64,7 @@ mod android_sparse;
 use android_sparse::AndroidSparse;
 #[cfg(feature = "android-sparse")]
 use android_sparse::SPARSE_HEADER_MAGIC;
+use sys::read_from_disk;
 
 /// Nesting depth limit for disk formats that can open other disk files.
 pub const MAX_NESTING_DEPTH: u32 = 10;
@@ -85,8 +83,6 @@ pub enum Error {
     CreateCompositeDisk(composite::Error),
     #[error("failure creating single file disk: {0}")]
     CreateSingleFileDisk(cros_async::AsyncError),
-    #[error("failure with fallocate: {0}")]
-    Fallocate(cros_async::AsyncError),
     #[error("failure with fdatasync: {0}")]
     Fdatasync(cros_async::AsyncError),
     #[error("failure with fsync: {0}")]
@@ -97,12 +93,16 @@ pub enum Error {
     IoFlush(io::Error),
     #[error("failure with fsync: {0}")]
     IoFsync(io::Error),
+    #[error("failure to punch hole: {0}")]
+    IoPunchHole(io::Error),
     #[error("checking host fs type: {0}")]
     HostFsType(base::Error),
     #[error("maximum disk nesting depth exceeded")]
     MaxNestingDepthExceeded,
     #[error("failure to punch hole: {0}")]
-    PunchHole(io::Error),
+    PunchHole(cros_async::AsyncError),
+    #[error("failure to punch hole for block device file: {0}")]
+    PunchHoleBlockDeviceFile(base::Error),
     #[cfg(feature = "qcow")]
     #[error("failure in qcow: {0}")]
     QcowError(qcow::Error),
@@ -152,17 +152,6 @@ impl DiskGetLen for File {
         let end = s.seek(SeekFrom::End(0))?;
         s.seek(SeekFrom::Start(orig_seek))?;
         Ok(end)
-    }
-}
-
-pub trait PunchHoleMut {
-    /// Replace a range of bytes with a hole.
-    fn punch_hole_mut(&mut self, offset: u64, length: u64) -> io::Result<()>;
-}
-
-impl<T: PunchHole> PunchHoleMut for T {
-    fn punch_hole_mut(&mut self, offset: u64, length: u64) -> io::Result<()> {
-        self.punch_hole(offset, length)
     }
 }
 
@@ -216,11 +205,10 @@ fn log_host_fs_type(file: &File) -> Result<()> {
 }
 
 /// Detect the type of an image file by checking for a valid header of the supported formats.
-pub fn detect_image_type(file: &File) -> Result<ImageType> {
+pub fn detect_image_type(file: &File, overlapped_mode: bool) -> Result<ImageType> {
     let mut f = file;
     let disk_size = f.get_len().map_err(Error::SeekingFile)?;
     let orig_seek = f.stream_position().map_err(Error::SeekingFile)?;
-    f.seek(SeekFrom::Start(0)).map_err(Error::SeekingFile)?;
 
     info!("disk size {}, ", disk_size);
     log_host_fs_type(f)?;
@@ -241,8 +229,7 @@ pub fn detect_image_type(file: &File) -> Result<ImageType> {
         disk_size as usize
     };
 
-    f.read_exact(&mut magic.data[0..magic_read_len])
-        .map_err(Error::ReadingHeader)?;
+    read_from_disk(f, 0, &mut magic.data[0..magic_read_len], overlapped_mode)?;
     f.seek(SeekFrom::Start(orig_seek))
         .map_err(Error::SeekingFile)?;
 
@@ -278,10 +265,28 @@ impl DiskFile for File {
 pub fn create_disk_file(
     raw_image: File,
     is_sparse_file: bool,
+    max_nesting_depth: u32,
+    image_path: &Path,
+) -> Result<Box<dyn DiskFile>> {
+    let image_type = detect_image_type(&raw_image, false)?;
+    create_disk_file_of_type(
+        raw_image,
+        is_sparse_file,
+        max_nesting_depth,
+        image_path,
+        image_type,
+    )
+}
+
+/// create an appropriate disk file to match give image type.
+pub fn create_disk_file_of_type(
+    raw_image: File,
+    is_sparse_file: bool,
     // max_nesting_depth is only used if the composite-disk or qcow features are enabled.
     #[allow(unused_variables)] mut max_nesting_depth: u32,
     // image_path is only used if the composite-disk feature is enabled.
     #[allow(unused_variables)] image_path: &Path,
+    image_type: ImageType,
 ) -> Result<Box<dyn DiskFile>> {
     if max_nesting_depth == 0 {
         return Err(Error::MaxNestingDepthExceeded);
@@ -291,7 +296,6 @@ pub fn create_disk_file(
         max_nesting_depth -= 1;
     }
 
-    let image_type = detect_image_type(&raw_image)?;
     Ok(match image_type {
         ImageType::Raw => {
             sys::apply_raw_disk_file_options(&raw_image, is_sparse_file)?;
@@ -410,14 +414,9 @@ pub trait AsyncDisk: DiskGetLen + FileSetLen + FileAllocate {
 /// A disk backed by a single file that implements `AsyncDisk` for access.
 pub struct SingleFileDisk {
     inner: IoSource<File>,
-}
-
-impl SingleFileDisk {
-    pub fn new(disk: File, ex: &Executor) -> Result<Self> {
-        ex.async_from(disk)
-            .map_err(Error::CreateSingleFileDisk)
-            .map(|inner| SingleFileDisk { inner })
-    }
+    // Whether the backed file is a block device since the punch-hole needs different operation.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    is_block_device_file: bool,
 }
 
 impl DiskGetLen for SingleFileDisk {
@@ -482,23 +481,28 @@ impl AsyncDisk for SingleFileDisk {
     }
 
     async fn punch_hole(&self, file_offset: u64, length: u64) -> Result<()> {
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        if self.is_block_device_file {
+            return base::linux::discard_block(self.inner.as_source(), file_offset, length)
+                .map_err(Error::PunchHoleBlockDeviceFile);
+        }
         self.inner
-            .fallocate(file_offset, length, AllocateMode::PunchHole)
+            .punch_hole(file_offset, length)
             .await
-            .map_err(Error::Fallocate)
+            .map_err(Error::PunchHole)
     }
 
     async fn write_zeroes_at(&self, file_offset: u64, length: u64) -> Result<()> {
         if self
             .inner
-            .fallocate(file_offset, length, AllocateMode::ZeroRange)
+            .write_zeroes_at(file_offset, length)
             .await
             .is_ok()
         {
             return Ok(());
         }
 
-        // Fall back to writing zeros if fallocate doesn't work.
+        // Fall back to filling zeros if more efficient write_zeroes_at doesn't work.
         let buf_size = min(length, 0x10000);
         let mut nwritten = 0;
         while nwritten < length {

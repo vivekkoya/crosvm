@@ -11,17 +11,14 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::cross_domain::CrossDomain;
-
 #[cfg(feature = "gfxstream")]
 use crate::gfxstream::Gfxstream;
-
 use crate::rutabaga_2d::Rutabaga2D;
 use crate::rutabaga_os::MemoryMapping;
 use crate::rutabaga_os::SafeDescriptor;
 use crate::rutabaga_snapshot::RutabagaResourceSnapshot;
 use crate::rutabaga_snapshot::RutabagaSnapshot;
 use crate::rutabaga_utils::*;
-
 #[cfg(feature = "virgl_renderer")]
 use crate::virgl_renderer::VirglRenderer;
 
@@ -186,7 +183,7 @@ pub trait RutabagaComponent {
     }
 
     /// Implementations must return a RutabagaHandle of the fence on success.
-    fn export_fence(&self, _fence_id: u32) -> RutabagaResult<RutabagaHandle> {
+    fn export_fence(&self, _fence_id: u64) -> RutabagaResult<RutabagaHandle> {
         Err(RutabagaError::Unsupported)
     }
 
@@ -877,7 +874,7 @@ impl Rutabaga {
     }
 
     /// Exports the given fence for import into other processes.
-    pub fn export_fence(&self, fence_id: u32) -> RutabagaResult<RutabagaHandle> {
+    pub fn export_fence(&self, fence_id: u64) -> RutabagaResult<RutabagaHandle> {
         let component = self
             .components
             .get(&self.default_component)
@@ -1183,9 +1180,6 @@ impl RutabagaBuilder {
         } else {
             #[cfg(feature = "virgl_renderer")]
             if self.default_component == RutabagaComponentType::VirglRenderer {
-                #[cfg(not(feature = "virgl_renderer_next"))]
-                let rutabaga_server_descriptor = None;
-
                 let virgl = VirglRenderer::init(
                     self.virglrenderer_flags,
                     fence_handler.clone(),

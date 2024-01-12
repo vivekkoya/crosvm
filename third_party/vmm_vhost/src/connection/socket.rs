@@ -1,44 +1,40 @@
 // Copyright 2021 The Chromium OS Authors. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Structs for Unix Domain Socket listener and endpoint.
+//! Structs for Unix Domain Socket listener and connection.
 
 use std::any::Any;
 use std::fs::File;
 use std::io::ErrorKind;
 use std::io::IoSlice;
 use std::io::IoSliceMut;
-use std::marker::PhantomData;
 use std::path::Path;
 use std::path::PathBuf;
 
 use base::AsRawDescriptor;
-use base::FromRawDescriptor;
-use base::IntoRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::ScmSocket;
 
-use crate::connection::Endpoint as EndpointTrait;
-use crate::connection::Listener as ListenerTrait;
-use crate::connection::Req;
+use crate::connection::Listener;
 use crate::message::*;
-use crate::take_single_file;
 use crate::unix::SystemListener;
+use crate::Connection;
 use crate::Error;
 use crate::Result;
 use crate::SystemStream;
 
 /// Unix domain socket listener for accepting incoming connections.
-pub struct Listener {
+pub struct SocketListener {
     fd: SystemListener,
     drop_path: Option<Box<dyn Any>>,
 }
 
-impl Listener {
+impl SocketListener {
     /// Create a unix domain socket listener.
     ///
     /// # Return:
-    /// * - the new Listener object on success.
+    /// * - the new SocketListener object on success.
     /// * - SocketError: failed to create listener socket.
     pub fn new<P: AsRef<Path>>(path: P, unlink: bool) -> Result<Self> {
         if unlink {
@@ -56,7 +52,7 @@ impl Listener {
             }
         }
 
-        Ok(Listener {
+        Ok(SocketListener {
             fd,
             drop_path: Some(Box::new(DropPath {
                 path: path.as_ref().to_owned(),
@@ -71,24 +67,18 @@ impl Listener {
     }
 }
 
-impl ListenerTrait for Listener {
-    type Connection = SystemStream;
-    type Endpoint = Endpoint<MasterReq>;
-
+impl Listener for SocketListener {
     /// Accept an incoming connection.
     ///
     /// # Return:
     /// * - Some(SystemListener): new SystemListener object if new incoming connection is available.
     /// * - None: no incoming connection available.
     /// * - SocketError: errors from accept().
-    fn accept(&mut self) -> Result<Option<Self::Endpoint>> {
+    fn accept(&mut self) -> Result<Option<Connection<MasterReq>>> {
         loop {
             match self.fd.accept() {
                 Ok((stream, _addr)) => {
-                    return Ok(Some(Endpoint {
-                        sock: stream,
-                        _r: PhantomData,
-                    }))
+                    return Ok(Some(Connection::from(stream)));
                 }
                 Err(e) => {
                     match e.kind() {
@@ -115,52 +105,102 @@ impl ListenerTrait for Listener {
     }
 }
 
-impl AsRawDescriptor for Listener {
+impl AsRawDescriptor for SocketListener {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.fd.as_raw_descriptor()
     }
 }
 
-/// Unix domain socket endpoint for vhost-user connection.
-pub struct Endpoint<R: Req> {
-    sock: SystemStream,
-    _r: PhantomData<R>,
+/// Unix domain socket based vhost-user connection.
+pub struct SocketPlatformConnection {
+    sock: ScmSocket<SystemStream>,
 }
 
-impl<R: Req> From<SystemStream> for Endpoint<R> {
+// TODO: Switch to TryFrom to avoid the unwrap.
+impl From<SystemStream> for SocketPlatformConnection {
     fn from(sock: SystemStream) -> Self {
         Self {
-            sock,
-            _r: PhantomData,
+            sock: sock.try_into().unwrap(),
         }
     }
 }
 
-impl<R: Req> EndpointTrait<R> for Endpoint<R> {
+// Advance the internal cursor of the slices.
+// This is same with a nightly API `IoSlice::advance_slices` but for `&[u8]`.
+fn advance_slices(bufs: &mut &mut [&[u8]], mut count: usize) {
+    use std::mem::take;
+
+    let mut idx = 0;
+    for b in bufs.iter() {
+        if count < b.len() {
+            break;
+        }
+        count -= b.len();
+        idx += 1;
+    }
+    *bufs = &mut take(bufs)[idx..];
+    if !bufs.is_empty() {
+        bufs[0] = &bufs[0][count..];
+    }
+}
+
+impl SocketPlatformConnection {
     /// Create a new stream by connecting to server at `str`.
     ///
     /// # Return:
-    /// * - the new Endpoint object on success.
+    /// * - the new SocketPlatformConnection object on success.
     /// * - SocketConnect: failed to connect to peer.
-    fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
         let sock = SystemStream::connect(path).map_err(Error::SocketConnect)?;
         Ok(Self::from(sock))
     }
 
-    /// Sends bytes from scatter-gather vectors over the socket with optional attached file
-    /// descriptors.
+    /// Sends all bytes from scatter-gather vectors with optional attached file descriptors. Will
+    /// loop until all data has been transfered.
     ///
-    /// # Return:
-    /// * - number of bytes sent on success
-    /// * - SocketRetry: temporary error caused by signals or short of resources.
-    /// * - SocketBroken: the underline socket is broken.
-    /// * - SocketError: other socket related errors.
-    fn send_iovec(&mut self, iovs: &[IoSlice], fds: Option<&[RawDescriptor]>) -> Result<usize> {
-        let rfds = match fds {
-            Some(rfds) => rfds,
-            _ => &[],
-        };
-        self.sock.send_bufs_with_fds(iovs, rfds).map_err(Into::into)
+    /// # TODO
+    /// This function takes a slice of `&[u8]` instead of `IoSlice` because the internal
+    /// cursor needs to be moved by `advance_slices()`.
+    /// Once `IoSlice::advance_slices()` becomes stable, this should be updated.
+    /// <https://github.com/rust-lang/rust/issues/62726>.
+    fn send_iovec_all(
+        &self,
+        mut iovs: &mut [&[u8]],
+        mut fds: Option<&[RawDescriptor]>,
+    ) -> Result<()> {
+        // Guarantee that `iovs` becomes empty if it doesn't contain any data.
+        advance_slices(&mut iovs, 0);
+
+        while !iovs.is_empty() {
+            let iovec: Vec<_> = iovs.iter_mut().map(|i| IoSlice::new(i)).collect();
+            match self.sock.send_vectored_with_fds(&iovec, fds.unwrap_or(&[])) {
+                Ok(n) => {
+                    fds = None;
+                    advance_slices(&mut iovs, n);
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::Interrupted => {}
+                    _ => return Err(Error::SocketError(e)),
+                },
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends a single message over the socket with optional attached file descriptors.
+    ///
+    /// - `hdr`: vhost message header
+    /// - `body`: vhost message body (may be empty to send a header-only message)
+    /// - `payload`: additional bytes to append to `body` (may be empty)
+    pub fn send_message(
+        &self,
+        hdr: &[u8],
+        body: &[u8],
+        payload: &[u8],
+        fds: Option<&[RawDescriptor]>,
+    ) -> Result<()> {
+        let mut iobufs = [hdr, body, payload];
+        self.send_iovec_all(&mut iobufs, fds)
     }
 
     /// Reads bytes from the socket into the given scatter/gather vectors with optional attached
@@ -182,90 +222,61 @@ impl<R: Req> EndpointTrait<R> for Endpoint<R> {
     /// * - SocketRetry: temporary error caused by signals or short of resources.
     /// * - SocketBroken: the underline socket is broken.
     /// * - SocketError: other socket related errors.
-    fn recv_into_bufs(
-        &mut self,
+    pub fn recv_into_bufs(
+        &self,
         bufs: &mut [IoSliceMut],
         allow_fd: bool,
     ) -> Result<(usize, Option<Vec<File>>)> {
-        let mut fd_array = if allow_fd {
-            vec![0; MAX_ATTACHED_FD_ENTRIES]
-        } else {
-            vec![]
-        };
-        let (bytes, fds) = self.sock.recv_iovecs_with_fds(bufs, &mut fd_array)?;
+        let max_fds = if allow_fd { MAX_ATTACHED_FD_ENTRIES } else { 0 };
+        let (bytes, fds) = self.sock.recv_vectored_with_fds(bufs, max_fds)?;
 
         // 0-bytes indicates that the connection is closed.
         if bytes == 0 {
             return Err(Error::Disconnect);
         }
 
-        let files = match fds {
-            0 => None,
-            n => {
-                let files = fd_array
-                    .iter()
-                    .take(n)
-                    .map(|fd| {
-                        // Safe because we have the ownership of `fd`.
-                        unsafe { File::from_raw_descriptor(*fd as RawDescriptor) }
-                    })
-                    .collect();
-                Some(files)
-            }
+        let files = if fds.is_empty() {
+            None
+        } else {
+            Some(fds.into_iter().map(File::from).collect())
         };
 
         Ok((bytes, files))
     }
-
-    fn create_slave_request_endpoint(
-        &mut self,
-        files: Option<Vec<File>>,
-    ) -> Result<Box<dyn EndpointTrait<SlaveReq>>> {
-        let file = take_single_file(files).ok_or(Error::InvalidMessage)?;
-        // Safe because we own the file
-        let tube = unsafe { SystemStream::from_raw_descriptor(file.into_raw_descriptor()) };
-        Ok(Box::new(Endpoint::from(tube)))
-    }
 }
 
-impl<T: Req> AsRawDescriptor for Endpoint<T> {
+impl AsRawDescriptor for SocketPlatformConnection {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.sock.as_raw_descriptor()
     }
 }
 
-impl<T: Req> AsMut<SystemStream> for Endpoint<T> {
+impl AsMut<SystemStream> for SocketPlatformConnection {
     fn as_mut(&mut self) -> &mut SystemStream {
-        &mut self.sock
+        self.sock.inner_mut()
     }
+}
+
+/// Convert a `SafeDescriptor` to a `UnixStream`.
+///
+/// # Safety
+///
+/// `file` must represent a unix domain socket.
+pub unsafe fn to_system_stream(fd: SafeDescriptor) -> Result<SystemStream> {
+    Ok(fd.into())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-    use std::io::Seek;
-    use std::io::SeekFrom;
-    use std::io::Write;
-    use std::mem;
-    use std::slice;
-
-    use tempfile::tempfile;
-    use tempfile::Builder;
-    use tempfile::TempDir;
-
     use super::*;
-    use crate::connection::EndpointExt;
-
-    fn temp_dir() -> TempDir {
-        Builder::new().prefix("/tmp/vhost_test").tempdir().unwrap()
-    }
+    use crate::connection::unix::tests::temp_dir;
 
     #[test]
     fn create_listener() {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let listener = Listener::new(&path, true).unwrap();
+        let listener = SocketListener::new(&path, true).unwrap();
 
         assert!(listener.as_raw_descriptor() > 0);
     }
@@ -275,7 +286,7 @@ mod tests {
         let dir = temp_dir();
         let mut path = dir.path().to_owned();
         path.push("sock");
-        let mut listener = Listener::new(&path, true).unwrap();
+        let mut listener = SocketListener::new(&path, true).unwrap();
         listener.set_nonblocking(true).unwrap();
 
         // accept on a fd without incoming connection
@@ -284,236 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn send_data() {
-        let dir = temp_dir();
-        let mut path = dir.path().to_owned();
-        path.push("sock");
-        let mut listener = Listener::new(&path, true).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
-
-        let buf1 = vec![0x1, 0x2, 0x3, 0x4];
-        let mut len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
-        assert_eq!(len, 4);
-        let (bytes, buf2, _) = slave.recv_into_buf(0x1000).unwrap();
-        assert_eq!(bytes, 4);
-        assert_eq!(&buf1[..], &buf2[..bytes]);
-
-        len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
-        assert_eq!(len, 4);
-        let (bytes, buf2, _) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[..2], &buf2[..]);
-        let (bytes, buf2, _) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[2..], &buf2[..]);
-    }
-
-    #[test]
-    fn send_fd() {
-        let dir = temp_dir();
-        let mut path = dir.path().to_owned();
-        path.push("sock");
-        let mut listener = Listener::new(&path, true).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
-
-        let mut fd = tempfile().unwrap();
-        write!(fd, "test").unwrap();
-
-        // Normal case for sending/receiving file descriptors
-        let buf1 = vec![0x1, 0x2, 0x3, 0x4];
-        let len = master
-            .send_slice(IoSlice::new(&buf1[..]), Some(&[fd.as_raw_descriptor()]))
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let (bytes, buf2, files) = slave.recv_into_buf(4).unwrap();
-        assert_eq!(bytes, 4);
-        assert_eq!(&buf1[..], &buf2[..]);
-        assert!(files.is_some());
-        let files = files.unwrap();
-        {
-            assert_eq!(files.len(), 1);
-            let mut file = &files[0];
-            let mut content = String::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_string(&mut content).unwrap();
-            assert_eq!(content, "test");
-        }
-
-        // Following communication pattern should work:
-        // Sending side: data(header, body) with fds
-        // Receiving side: data(header) with fds, data(body)
-        let len = master
-            .send_slice(
-                IoSlice::new(&buf1[..]),
-                Some(&[
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[..2], &buf2[..]);
-        assert!(files.is_some());
-        let files = files.unwrap();
-        {
-            assert_eq!(files.len(), 3);
-            let mut file = &files[1];
-            let mut content = String::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_string(&mut content).unwrap();
-            assert_eq!(content, "test");
-        }
-        let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[2..], &buf2[..]);
-        assert!(files.is_none());
-
-        // Following communication pattern should not work:
-        // Sending side: data(header, body) with fds
-        // Receiving side: data(header), data(body) with fds
-        let len = master
-            .send_slice(
-                IoSlice::new(&buf1[..]),
-                Some(&[
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let buf4 = slave.recv_data(2).unwrap();
-        assert_eq!(buf4.len(), 2);
-        assert_eq!(&buf1[..2], &buf4[..]);
-        let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[2..], &buf2[..]);
-        assert!(files.is_none());
-
-        // Following communication pattern should work:
-        // Sending side: data, data with fds
-        // Receiving side: data, data with fds
-        let len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
-        assert_eq!(len, 4);
-        let len = master
-            .send_slice(
-                IoSlice::new(&buf1[..]),
-                Some(&[
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let (bytes, buf2, files) = slave.recv_into_buf(0x4).unwrap();
-        assert_eq!(bytes, 4);
-        assert_eq!(&buf1[..], &buf2[..]);
-        assert!(files.is_none());
-
-        let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[..2], &buf2[..]);
-        assert!(files.is_some());
-        let files = files.unwrap();
-        {
-            assert_eq!(files.len(), 3);
-            let mut file = &files[1];
-            let mut content = String::new();
-            file.seek(SeekFrom::Start(0)).unwrap();
-            file.read_to_string(&mut content).unwrap();
-            assert_eq!(content, "test");
-        }
-        let (bytes, buf2, files) = slave.recv_into_buf(0x2).unwrap();
-        assert_eq!(bytes, 2);
-        assert_eq!(&buf1[2..], &buf2[..]);
-        assert!(files.is_none());
-
-        // Following communication pattern should not work:
-        // Sending side: data1, data2 with fds
-        // Receiving side: data + partial of data2, left of data2 with fds
-        let len = master.send_slice(IoSlice::new(&buf1[..]), None).unwrap();
-        assert_eq!(len, 4);
-        let len = master
-            .send_slice(
-                IoSlice::new(&buf1[..]),
-                Some(&[
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let v = slave.recv_data(5).unwrap();
-        assert_eq!(v.len(), 5);
-
-        let (bytes, _, files) = slave.recv_into_buf(0x4).unwrap();
-        assert_eq!(bytes, 3);
-        assert!(files.is_none());
-
-        // If the target fd array is too small, extra file descriptors will get lost.
-        let len = master
-            .send_slice(
-                IoSlice::new(&buf1[..]),
-                Some(&[
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                    fd.as_raw_descriptor(),
-                ]),
-            )
-            .unwrap();
-        assert_eq!(len, 4);
-
-        let (bytes, _, files) = slave.recv_into_buf(0x4).unwrap();
-        assert_eq!(bytes, 4);
-        assert!(files.is_some());
-    }
-
-    #[test]
-    fn send_recv() {
-        let dir = temp_dir();
-        let mut path = dir.path().to_owned();
-        path.push("sock");
-        let mut listener = Listener::new(&path, true).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let mut master = Endpoint::<MasterReq>::connect(&path).unwrap();
-        let mut slave = listener.accept().unwrap().unwrap();
-
-        let mut hdr1 =
-            VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0, mem::size_of::<u64>() as u32);
-        hdr1.set_need_reply(true);
-        let features1 = 0x1u64;
-        master.send_message(&hdr1, &features1, None).unwrap();
-
-        let mut features2 = 0u64;
-        let slice = unsafe {
-            slice::from_raw_parts_mut(
-                (&mut features2 as *mut u64) as *mut u8,
-                mem::size_of::<u64>(),
-            )
-        };
-        let (hdr2, bytes, files) = slave.recv_body_into_buf(slice).unwrap();
-        assert_eq!(hdr1, hdr2);
-        assert_eq!(bytes, 8);
-        assert_eq!(features1, features2);
-        assert!(files.is_none());
-
-        master.send_header(&hdr1, None).unwrap();
-        let (hdr2, files) = slave.recv_header().unwrap();
-        assert_eq!(hdr1, hdr2);
-        assert!(files.is_none());
+    fn test_advance_slices() {
+        // Test case from https://doc.rust-lang.org/std/io/struct.IoSlice.html#method.advance_slices
+        let buf1 = [1; 8];
+        let buf2 = [2; 16];
+        let buf3 = [3; 8];
+        let mut bufs = &mut [&buf1[..], &buf2[..], &buf3[..]][..];
+        advance_slices(&mut bufs, 10);
+        assert_eq!(bufs[0], [2; 14].as_ref());
+        assert_eq!(bufs[1], [3; 8].as_ref());
     }
 }

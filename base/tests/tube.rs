@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use base::descriptor::FromRawDescriptor;
 use base::descriptor::SafeDescriptor;
-use base::platform::deserialize_with_descriptors;
-use base::platform::SerializeDescriptors;
+use base::deserialize_with_descriptors;
 use base::Event;
 use base::EventToken;
 use base::ReadNotifier;
 use base::RecvTube;
 use base::SendTube;
+use base::SerializeDescriptors;
 use base::Tube;
 use base::WaitContext;
 use serde::Deserialize;
@@ -135,15 +135,12 @@ fn test_serialize_tube_pair() {
     let msg_descriptors = msg_serialize.into_descriptors();
 
     // Deserialize the Tube
-    let mut msg_descriptors_safe = msg_descriptors
-        .into_iter()
-        .map(|v| Some(unsafe { SafeDescriptor::from_raw_descriptor(v) }))
-        .collect();
-    let tube_deserialized: Tube = deserialize_with_descriptors(
-        || serde_json::from_slice(&serialized),
-        &mut msg_descriptors_safe,
-    )
-    .unwrap();
+    let msg_descriptors_safe = msg_descriptors.into_iter().map(|v|
+            // SAFETY: `v` is expected to be valid
+            unsafe { SafeDescriptor::from_raw_descriptor(v) });
+    let tube_deserialized: Tube =
+        deserialize_with_descriptors(|| serde_json::from_slice(&serialized), msg_descriptors_safe)
+            .unwrap();
 
     // Send a message through deserialized Tube
     tube_deserialized.send(&"hi".to_string()).unwrap();

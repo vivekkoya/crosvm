@@ -9,6 +9,8 @@ use std::fs::remove_file;
 use std::io;
 use std::mem;
 use std::mem::size_of;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -16,9 +18,7 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 use std::ops::Deref;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::io::RawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::null_mut;
@@ -26,8 +26,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use libc::c_int;
-use libc::in6_addr;
-use libc::in_addr;
 use libc::recvfrom;
 use libc::sa_family_t;
 use libc::sockaddr;
@@ -38,18 +36,19 @@ use libc::AF_INET;
 use libc::AF_INET6;
 use libc::MSG_PEEK;
 use libc::MSG_TRUNC;
-use libc::SOCK_CLOEXEC;
-use libc::SOCK_STREAM;
 use log::warn;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::sock_ctrl_msg::ScmSocket;
-use super::sock_ctrl_msg::SCM_SOCKET_MAX_FD_COUNT;
-use super::Error;
-use super::RawDescriptor;
 use crate::descriptor::AsRawDescriptor;
 use crate::descriptor::FromRawDescriptor;
+use crate::descriptor::IntoRawDescriptor;
+use crate::handle_eintr_errno;
+use crate::sys::sockaddr_un;
+use crate::sys::sockaddrv4_to_lib_c;
+use crate::sys::sockaddrv6_to_lib_c;
+use crate::Error;
+use crate::RawDescriptor;
 use crate::SafeDescriptor;
 
 /// Assist in handling both IP version 4 and IP version 6.
@@ -77,54 +76,41 @@ impl From<InetVersion> for sa_family_t {
     }
 }
 
-fn sockaddrv4_to_lib_c(s: &SocketAddrV4) -> sockaddr_in {
-    sockaddr_in {
-        sin_family: AF_INET as sa_family_t,
-        sin_port: s.port().to_be(),
-        sin_addr: in_addr {
-            s_addr: u32::from_ne_bytes(s.ip().octets()),
-        },
-        sin_zero: [0; 8],
-    }
-}
-
-fn sockaddrv6_to_lib_c(s: &SocketAddrV6) -> sockaddr_in6 {
-    sockaddr_in6 {
-        sin6_family: AF_INET6 as sa_family_t,
-        sin6_port: s.port().to_be(),
-        sin6_flowinfo: 0,
-        sin6_addr: in6_addr {
-            s6_addr: s.ip().octets(),
-        },
-        sin6_scope_id: 0,
-    }
-}
-
-fn socket(domain: c_int, sock_type: c_int, protocol: c_int) -> io::Result<SafeDescriptor> {
+pub(in crate::sys) fn socket(
+    domain: c_int,
+    sock_type: c_int,
+    protocol: c_int,
+) -> io::Result<SafeDescriptor> {
+    // SAFETY:
     // Safe socket initialization since we handle the returned error.
     match unsafe { libc::socket(domain, sock_type, protocol) } {
         -1 => Err(io::Error::last_os_error()),
+        // SAFETY:
         // Safe because we own the file descriptor.
         fd => Ok(unsafe { SafeDescriptor::from_raw_descriptor(fd) }),
     }
 }
 
-fn socketpair(
+pub(in crate::sys) fn socketpair(
     domain: c_int,
     sock_type: c_int,
     protocol: c_int,
 ) -> io::Result<(SafeDescriptor, SafeDescriptor)> {
     let mut fds = [0, 0];
+    // SAFETY:
     // Safe because we give enough space to store all the fds and we check the return value.
     match unsafe { libc::socketpair(domain, sock_type, protocol, fds.as_mut_ptr()) } {
         -1 => Err(io::Error::last_os_error()),
-        // Safe because we own the file descriptors.
-        _ => Ok(unsafe {
-            (
-                SafeDescriptor::from_raw_descriptor(fds[0]),
-                SafeDescriptor::from_raw_descriptor(fds[1]),
-            )
-        }),
+        _ => Ok(
+            // SAFETY:
+            // Safe because we own the file descriptors.
+            unsafe {
+                (
+                    SafeDescriptor::from_raw_descriptor(fds[0]),
+                    SafeDescriptor::from_raw_descriptor(fds[1]),
+                )
+            },
+        ),
     }
 }
 
@@ -135,22 +121,11 @@ fn socketpair(
 /// TcpListener.
 #[derive(Debug)]
 pub struct TcpSocket {
-    inet_version: InetVersion,
-    descriptor: SafeDescriptor,
+    pub(in crate::sys) inet_version: InetVersion,
+    pub(in crate::sys) descriptor: SafeDescriptor,
 }
 
 impl TcpSocket {
-    pub fn new(inet_version: InetVersion) -> io::Result<Self> {
-        Ok(TcpSocket {
-            inet_version,
-            descriptor: socket(
-                Into::<sa_family_t>::into(inet_version) as c_int,
-                SOCK_STREAM | SOCK_CLOEXEC,
-                0,
-            )?,
-        })
-    }
-
     pub fn bind<A: ToSocketAddrs>(&mut self, addr: A) -> io::Result<()> {
         let sockaddr = addr
             .to_socket_addrs()
@@ -161,6 +136,7 @@ impl TcpSocket {
         let ret = match sockaddr {
             SocketAddr::V4(a) => {
                 let sin = sockaddrv4_to_lib_c(&a);
+                // SAFETY:
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
                     libc::bind(
@@ -172,6 +148,7 @@ impl TcpSocket {
             }
             SocketAddr::V6(a) => {
                 let sin6 = sockaddrv6_to_lib_c(&a);
+                // SAFETY:
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
                     libc::bind(
@@ -200,6 +177,7 @@ impl TcpSocket {
         let ret = match sockaddr {
             SocketAddr::V4(a) => {
                 let sin = sockaddrv4_to_lib_c(&a);
+                // SAFETY:
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
                     libc::connect(
@@ -211,6 +189,7 @@ impl TcpSocket {
             }
             SocketAddr::V6(a) => {
                 let sin6 = sockaddrv6_to_lib_c(&a);
+                // SAFETY:
                 // Safe because this doesn't modify any memory and we check the return value.
                 unsafe {
                     libc::connect(
@@ -231,6 +210,7 @@ impl TcpSocket {
     }
 
     pub fn listen(self) -> io::Result<TcpListener> {
+        // SAFETY:
         // Safe because this doesn't modify any memory and we check the return value.
         let ret = unsafe { libc::listen(self.as_raw_descriptor(), 1) };
         if ret < 0 {
@@ -245,15 +225,11 @@ impl TcpSocket {
     pub fn local_port(&self) -> io::Result<u16> {
         match self.inet_version {
             InetVersion::V4 => {
-                let mut sin = sockaddr_in {
-                    sin_family: 0,
-                    sin_port: 0,
-                    sin_addr: in_addr { s_addr: 0 },
-                    sin_zero: [0; 8],
-                };
+                let mut sin = sockaddrv4_to_lib_c(&SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
 
-                // Safe because we give a valid pointer for addrlen and check the length.
                 let mut addrlen = size_of::<sockaddr_in>() as socklen_t;
+                // SAFETY:
+                // Safe because we give a valid pointer for addrlen and check the length.
                 let ret = unsafe {
                     // Get the socket address that was actually bound.
                     libc::getsockname(
@@ -273,16 +249,16 @@ impl TcpSocket {
                 }
             }
             InetVersion::V6 => {
-                let mut sin6 = sockaddr_in6 {
-                    sin6_family: 0,
-                    sin6_port: 0,
-                    sin6_flowinfo: 0,
-                    sin6_addr: in6_addr { s6_addr: [0; 16] },
-                    sin6_scope_id: 0,
-                };
+                let mut sin6 = sockaddrv6_to_lib_c(&SocketAddrV6::new(
+                    Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0),
+                    0,
+                    0,
+                    0,
+                ));
 
-                // Safe because we give a valid pointer for addrlen and check the length.
                 let mut addrlen = size_of::<sockaddr_in6>() as socklen_t;
+                // SAFETY:
+                // Safe because we give a valid pointer for addrlen and check the length.
                 let ret = unsafe {
                     // Get the socket address that was actually bound.
                     libc::getsockname(
@@ -312,62 +288,19 @@ impl AsRawDescriptor for TcpSocket {
 }
 
 // Offset of sun_path in structure sockaddr_un.
-fn sun_path_offset() -> usize {
+pub(in crate::sys) fn sun_path_offset() -> usize {
     // Prefer 0 to null() so that we do not need to subtract from the `sub_path` pointer.
     #[allow(clippy::zero_ptr)]
     let addr = 0 as *const libc::sockaddr_un;
+    // SAFETY:
     // Safe because we only use the dereference to create a pointer to the desired field in
     // calculating the offset.
     unsafe { &(*addr).sun_path as *const _ as usize }
 }
 
-// Return `sockaddr_un` for a given `path`
-fn sockaddr_un<P: AsRef<Path>>(path: P) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
-    let mut addr = libc::sockaddr_un {
-        sun_family: libc::AF_UNIX as libc::sa_family_t,
-        sun_path: [0; 108],
-    };
-
-    // Check if the input path is valid. Since
-    // * The pathname in sun_path should be null-terminated.
-    // * The length of the pathname, including the terminating null byte,
-    //   should not exceed the size of sun_path.
-    //
-    // and our input is a `Path`, we only need to check
-    // * If the string size of `Path` should less than sizeof(sun_path)
-    // and make sure `sun_path` ends with '\0' by initialized the sun_path with zeros.
-    //
-    // Empty path name is valid since abstract socket address has sun_paht[0] = '\0'
-    let bytes = path.as_ref().as_os_str().as_bytes();
-    if bytes.len() >= addr.sun_path.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Input path size should be less than the length of sun_path.",
-        ));
-    };
-
-    // Copy data from `path` to `addr.sun_path`
-    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
-        *dst = *src as libc::c_char;
-    }
-
-    // The addrlen argument that describes the enclosing sockaddr_un structure
-    // should have a value of at least:
-    //
-    //     offsetof(struct sockaddr_un, sun_path) + strlen(addr.sun_path) + 1
-    //
-    // or, more simply, addrlen can be specified as sizeof(struct sockaddr_un).
-    let len = sun_path_offset() + bytes.len() + 1;
-    Ok((addr, len as libc::socklen_t))
-}
-
 /// A Unix `SOCK_SEQPACKET` socket point to given `path`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UnixSeqpacket(SafeDescriptor);
-
-// Safety: UnixSeqpacket is just a file descriptor, and it is safe to send FDs
-// between threads.
-unsafe impl Send for UnixSeqpacket {}
 
 impl UnixSeqpacket {
     /// Open a `SOCK_SEQPACKET` connection to socket named by `path`.
@@ -383,6 +316,7 @@ impl UnixSeqpacket {
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let descriptor = socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0)?;
         let (addr, len) = sockaddr_un(path.as_ref())?;
+        // SAFETY:
         // Safe connect since we handle the error and use the right length generated from
         // `sockaddr_un`.
         unsafe {
@@ -398,14 +332,6 @@ impl UnixSeqpacket {
         Ok(UnixSeqpacket(descriptor))
     }
 
-    /// Creates a pair of connected `SOCK_SEQPACKET` sockets.
-    ///
-    /// Both returned file descriptors have the `CLOEXEC` flag set.
-    pub fn pair() -> io::Result<(UnixSeqpacket, UnixSeqpacket)> {
-        socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0)
-            .map(|(s0, s1)| (UnixSeqpacket::from(s0), UnixSeqpacket::from(s1)))
-    }
-
     /// Clone the underlying FD.
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self(self.0.try_clone()?))
@@ -414,6 +340,8 @@ impl UnixSeqpacket {
     /// Gets the number of bytes that can be read from this socket without blocking.
     pub fn get_readable_bytes(&self) -> io::Result<usize> {
         let mut byte_count = 0i32;
+        // SAFETY:
+        // Safe because self has valid raw descriptor and return value are checked.
         let ret = unsafe { libc::ioctl(self.as_raw_descriptor(), libc::FIONREAD, &mut byte_count) };
         if ret < 0 {
             Err(io::Error::last_os_error())
@@ -434,6 +362,7 @@ impl UnixSeqpacket {
         #[cfg(debug_assertions)]
         let buf = &mut 0 as *mut _ as *mut _;
 
+        // SAFETY:
         // This form of recvfrom doesn't modify any data because all null pointers are used. We only
         // use the return value and check for errors on an FD owned by this structure.
         let ret = unsafe {
@@ -464,6 +393,7 @@ impl UnixSeqpacket {
     /// # Errors
     /// Returns error when `libc::write` failed.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        // SAFETY:
         // Safe since we make sure the input `count` == `buf.len()` and handle the returned error.
         unsafe {
             let ret = libc::write(
@@ -490,6 +420,7 @@ impl UnixSeqpacket {
     /// # Errors
     /// Returns error when `libc::read` failed.
     pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        // SAFETY:
         // Safe since we make sure the input `count` == `buf.len()` and handle the returned error.
         unsafe {
             let ret = libc::read(
@@ -533,25 +464,6 @@ impl UnixSeqpacket {
         Ok(buf)
     }
 
-    /// Read data and fds from the socket fd to a new pair of `Vec`.
-    ///
-    /// # Returns
-    /// * `Vec<u8>` - A new `Vec` with the entire received packet's bytes.
-    /// * `Vec<RawFd>` - A new `Vec` with the entire received packet's fds.
-    ///
-    /// # Errors
-    /// Returns error when `recv_with_fds` or `get_readable_bytes` failed.
-    pub fn recv_as_vec_with_fds(&self) -> io::Result<(Vec<u8>, Vec<RawFd>)> {
-        let packet_size = self.next_packet_size()?;
-        let mut buf = vec![0; packet_size];
-        let mut fd_buf = vec![-1; SCM_SOCKET_MAX_FD_COUNT];
-        let (read_bytes, read_fds) =
-            self.recv_with_fds(io::IoSliceMut::new(&mut buf), &mut fd_buf)?;
-        buf.resize(read_bytes, 0);
-        fd_buf.resize(read_fds, -1);
-        Ok((buf, fd_buf))
-    }
-
     #[allow(clippy::useless_conversion)]
     fn set_timeout(&self, timeout: Option<Duration>, kind: libc::c_int) -> io::Result<()> {
         let timeval = match timeout {
@@ -574,6 +486,7 @@ impl UnixSeqpacket {
                 tv_usec: 0,
             },
         };
+        // SAFETY:
         // Safe because we own the fd, and the length of the pointer's data is the same as the
         // passed in length parameter. The level argument is valid, the kind is assumed to be valid,
         // and the return value is checked.
@@ -606,6 +519,7 @@ impl UnixSeqpacket {
     /// Sets the blocking mode for this socket.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         let mut nonblocking = nonblocking as libc::c_int;
+        // SAFETY:
         // Safe because the return value is checked, and this ioctl call sets the nonblocking mode
         // and does not continue holding the file descriptor after the call.
         let ret = unsafe { libc::ioctl(self.as_raw_descriptor(), libc::FIONBIO, &mut nonblocking) };
@@ -638,6 +552,12 @@ impl FromRawDescriptor for UnixSeqpacket {
 impl AsRawDescriptor for UnixSeqpacket {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.0.as_raw_descriptor()
+    }
+}
+
+impl IntoRawDescriptor for UnixSeqpacket {
+    fn into_raw_descriptor(self) -> RawDescriptor {
+        self.0.into_raw_descriptor()
     }
 }
 
@@ -677,6 +597,7 @@ impl UnixSeqpacketListener {
                 .expect("fd should be an integer");
             let mut result: c_int = 0;
             let mut result_len = size_of::<c_int>() as libc::socklen_t;
+            // SAFETY: Safe because fd and other args are valid and the return value is checked.
             let ret = unsafe {
                 libc::getsockopt(
                     fd,
@@ -695,6 +616,7 @@ impl UnixSeqpacketListener {
                     "specified descriptor is not a listening socket",
                 ));
             }
+            // SAFETY:
             // Safe because we validated the socket file descriptor.
             let descriptor = unsafe { SafeDescriptor::from_raw_descriptor(fd) };
             return Ok(UnixSeqpacketListener {
@@ -706,6 +628,7 @@ impl UnixSeqpacketListener {
         let descriptor = socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0)?;
         let (addr, len) = sockaddr_un(path.as_ref())?;
 
+        // SAFETY:
         // Safe connect since we handle the error and use the right length generated from
         // `sockaddr_un`.
         unsafe {
@@ -728,31 +651,6 @@ impl UnixSeqpacketListener {
         })
     }
 
-    /// Blocks for and accepts a new incoming connection and returns the socket associated with that
-    /// connection.
-    ///
-    /// The returned socket has the close-on-exec flag set.
-    pub fn accept(&self) -> io::Result<UnixSeqpacket> {
-        // Safe because we own this fd and the kernel will not write to null pointers.
-        match unsafe {
-            libc::accept4(
-                self.as_raw_descriptor(),
-                null_mut(),
-                null_mut(),
-                libc::SOCK_CLOEXEC,
-            )
-        } {
-            -1 => Err(io::Error::last_os_error()),
-            fd => {
-                // Safe because we checked the return value of accept. Therefore, the return value
-                // must be a valid socket.
-                Ok(UnixSeqpacket::from(unsafe {
-                    SafeDescriptor::from_raw_descriptor(fd)
-                }))
-            }
-        }
-    }
-
     pub fn accept_with_timeout(&self, timeout: Duration) -> io::Result<UnixSeqpacket> {
         let start = Instant::now();
 
@@ -765,6 +663,7 @@ impl UnixSeqpacketListener {
             let elapsed = Instant::now().saturating_duration_since(start);
             let remaining = timeout.checked_sub(elapsed).unwrap_or(Duration::ZERO);
             let cur_timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            // SAFETY:
             // Safe because we give a valid pointer to a list (of 1) FD and we check
             // the return value.
             match unsafe { libc::poll(&mut fds, 1, cur_timeout_ms) }.cmp(&0) {
@@ -781,10 +680,7 @@ impl UnixSeqpacketListener {
 
     /// Gets the path that this listener is bound to.
     pub fn path(&self) -> io::Result<PathBuf> {
-        let mut addr = libc::sockaddr_un {
-            sun_family: libc::AF_UNIX as libc::sa_family_t,
-            sun_path: [0; 108],
-        };
+        let mut addr = sockaddr_un(Path::new(""))?.0;
         if self.no_path {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -795,6 +691,7 @@ impl UnixSeqpacketListener {
             - &addr.sun_family as *const _ as usize)
             as libc::socklen_t;
         let mut len = mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY:
         // Safe because the length given matches the length of the data of the given pointer, and we
         // check the return value.
         let ret = unsafe {
@@ -829,6 +726,7 @@ impl UnixSeqpacketListener {
     /// Sets the blocking mode for this socket.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         let mut nonblocking = nonblocking as libc::c_int;
+        // SAFETY:
         // Safe because the return value is checked, and this ioctl call sets the nonblocking mode
         // and does not continue holding the file descriptor after the call.
         let ret = unsafe { libc::ioctl(self.as_raw_descriptor(), libc::FIONBIO, &mut nonblocking) };

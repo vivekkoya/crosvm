@@ -3,9 +3,9 @@
 // found in the LICENSE file.
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        mod unix;
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        mod linux;
+        use linux as platform;
     } else if #[cfg(windows)] {
         pub mod windows;
         use windows as platform;
@@ -14,3 +14,5 @@ cfg_if::cfg_if! {
 
 pub(crate) use platform::process_rx;
 pub(crate) use platform::process_tx;
+pub(crate) use platform::validate_and_configure_tap;
+pub(crate) use platform::virtio_features_to_tap_offload;

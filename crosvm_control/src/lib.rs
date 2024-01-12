@@ -19,7 +19,7 @@ use std::ffi::CStr;
 use std::panic::catch_unwind;
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use std::time::Duration;
 
 use libc::c_char;
@@ -54,7 +54,7 @@ fn validate_socket_path(socket_path: *const c_char) -> Option<PathBuf> {
 
 /// Stops the crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -75,7 +75,7 @@ pub unsafe extern "C" fn crosvm_client_stop_vm(socket_path: *const c_char) -> bo
 
 /// Suspends the crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -96,7 +96,7 @@ pub unsafe extern "C" fn crosvm_client_suspend_vm(socket_path: *const c_char) ->
 
 /// Resumes the crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -117,7 +117,7 @@ pub unsafe extern "C" fn crosvm_client_resume_vm(socket_path: *const c_char) -> 
 
 /// Creates an RT vCPU for the crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -139,7 +139,7 @@ pub unsafe extern "C" fn crosvm_client_make_rt_vm(socket_path: *const c_char) ->
 /// Adjusts the balloon size of the crosvm instance whose control socket is
 /// listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -166,7 +166,13 @@ pub unsafe extern "C" fn crosvm_client_balloon_vms(
 }
 
 /// See crosvm_client_balloon_vms.
-#[cfg(unix)]
+///
+/// # Safety
+///
+/// Function is unsafe due to raw pointer usage - a null pointer could be passed in. Usage of
+/// !raw_pointer.is_null() checks should prevent unsafe behavior but the caller should ensure no
+/// null pointers are passed.
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_client_balloon_vms_wait_with_timeout(
     socket_path: *const c_char,
@@ -196,7 +202,7 @@ pub unsafe extern "C" fn crosvm_client_balloon_vms_wait_with_timeout(
 
 /// Enable vmm swap for crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -218,7 +224,7 @@ pub unsafe extern "C" fn crosvm_client_swap_enable_vm(socket_path: *const c_char
 /// Swap out staging memory for crosvm instance whose control socket is listening
 /// on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -248,7 +254,7 @@ pub struct SwapDisableArgs {
 
 /// Disable vmm swap according to `args`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -278,7 +284,7 @@ pub unsafe extern "C" fn crosvm_client_swap_disable_vm(args: *mut SwapDisableArg
 /// Trim staging memory for vmm swap for crosvm instance whose control socket is listening on
 /// `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -302,7 +308,7 @@ pub unsafe extern "C" fn crosvm_client_swap_trim(socket_path: *const c_char) -> 
 ///
 /// The parameters `status` is optional and will only be written to if they are non-null.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -427,7 +433,7 @@ pub unsafe extern "C" fn crosvm_client_usb_list(
 /// * `dev_path` - Path to the USB device (Most likely `/dev/bus/usb/<bus>/<addr>`).
 /// * `out_port` - (optional) internal port will be written here if provided.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -454,6 +460,7 @@ pub unsafe extern "C" fn crosvm_client_usb_attach(
 
             if let Ok(UsbControlResult::Ok { port }) = do_usb_attach(socket_path, dev_path) {
                 if !out_port.is_null() {
+                    // SAFETY: trivially safe
                     unsafe { *out_port = port };
                 }
                 true
@@ -470,7 +477,7 @@ pub unsafe extern "C" fn crosvm_client_usb_attach(
 /// Detaches an USB device from crosvm instance whose control socket is listening on `socket_path`.
 /// `port` determines device to be detached.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -570,7 +577,7 @@ pub unsafe extern "C" fn crosvm_client_net_tap_detach(
 /// Modifies the battery status of crosvm instance whose control socket is listening on
 /// `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -589,8 +596,11 @@ pub unsafe extern "C" fn crosvm_client_modify_battery(
             if battery_type.is_null() || property.is_null() || target.is_null() {
                 return false;
             }
+            // SAFETY: trivially safe
             let battery_type = unsafe { CStr::from_ptr(battery_type) };
+            // SAFETY: trivially safe
             let property = unsafe { CStr::from_ptr(property) };
+            // SAFETY: trivially safe
             let target = unsafe { CStr::from_ptr(target) };
 
             do_modify_battery(
@@ -609,7 +619,7 @@ pub unsafe extern "C" fn crosvm_client_modify_battery(
 
 /// Resizes the disk of the crosvm instance whose control socket is listening on `socket_path`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -683,7 +693,7 @@ impl From<&BalloonStats> for BalloonStatsFfi {
 /// The parameters `stats` and `actual` are optional and will only be written to if they are
 /// non-null.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Note
 ///
@@ -702,7 +712,7 @@ pub unsafe extern "C" fn crosvm_client_balloon_stats(
 ) -> bool {
     crosvm_client_balloon_stats_impl(
         socket_path,
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         None,
         stats,
         actual,
@@ -710,7 +720,13 @@ pub unsafe extern "C" fn crosvm_client_balloon_stats(
 }
 
 /// See crosvm_client_balloon_stats.
-#[cfg(unix)]
+///
+/// # Safety
+///
+/// Function is unsafe due to raw pointer usage - a null pointer could be passed in. Usage of
+/// !raw_pointer.is_null() checks should prevent unsafe behavior but the caller should ensure no
+/// null pointers are passed.
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[no_mangle]
 pub unsafe extern "C" fn crosvm_client_balloon_stats_with_timeout(
     socket_path: *const c_char,
@@ -728,7 +744,7 @@ pub unsafe extern "C" fn crosvm_client_balloon_stats_with_timeout(
 
 fn crosvm_client_balloon_stats_impl(
     socket_path: *const c_char,
-    #[cfg(unix)] timeout_ms: Option<Duration>,
+    #[cfg(any(target_os = "android", target_os = "linux"))] timeout_ms: Option<Duration>,
     stats: *mut BalloonStatsFfi,
     actual: *mut u64,
 ) -> bool {
@@ -737,7 +753,7 @@ fn crosvm_client_balloon_stats_impl(
             let request = &VmRequest::BalloonCommand(BalloonControlCommand::Stats {});
             #[cfg(not(unix))]
             let resp = handle_request(request, socket_path);
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             let resp = handle_request_with_timeout(request, socket_path, timeout_ms);
             if let Ok(VmResponse::BalloonStats {
                 stats: ref balloon_stats,
@@ -849,7 +865,7 @@ pub struct BalloonWSRConfigFfi {
 
 /// Returns balloon working set of the crosvm instance whose control socket is listening on socket_path.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -927,7 +943,7 @@ impl TryFrom<RegisteredEventFfi> for RegisteredEvent {
 
 /// Registers the connected process as a listener for `event`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -965,7 +981,7 @@ pub unsafe extern "C" fn crosvm_client_register_events_listener(
 
 /// Unegisters the connected process as a listener for `event`.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -1003,7 +1019,7 @@ pub unsafe extern "C" fn crosvm_client_unregister_events_listener(
 
 /// Unegisters the connected process as a listener for all events.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///
@@ -1035,7 +1051,7 @@ pub unsafe extern "C" fn crosvm_client_unregister_listener(
 
 /// Set Working Set Reporting config in guest.
 ///
-/// The function returns true on success or false if an error occured.
+/// The function returns true on success or false if an error occurred.
 ///
 /// # Safety
 ///

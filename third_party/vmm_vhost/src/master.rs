@@ -6,9 +6,6 @@
 use std::fs::File;
 use std::mem;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
 
 use anyhow::anyhow;
 use base::AsRawDescriptor;
@@ -21,49 +18,44 @@ use zerocopy::FromBytes;
 
 use crate::backend::VhostUserMemoryRegionInfo;
 use crate::backend::VringConfigData;
-use crate::connection::Endpoint;
-use crate::connection::EndpointExt;
+use crate::into_single_file;
 use crate::message::*;
-use crate::take_single_file;
+use crate::Connection;
 use crate::Error as VhostUserError;
+use crate::MasterReq;
 use crate::Result as VhostUserResult;
 use crate::Result;
 use crate::SystemStream;
 
 /// Client for a vhost-user device. The API is a thin abstraction over the vhost-user protocol.
-#[derive(Clone)]
-pub struct Master<E: Endpoint<MasterReq>> {
-    node: Arc<Mutex<MasterInternal<E>>>,
+pub struct Master {
+    // Used to send requests to the slave.
+    main_sock: Connection<MasterReq>,
+    // Cached virtio features from the slave.
+    virtio_features: u64,
+    // Cached acked virtio features from the driver.
+    acked_virtio_features: u64,
+    // Cached vhost-user protocol features.
+    acked_protocol_features: u64,
 }
 
-impl<E: Endpoint<MasterReq> + From<SystemStream>> Master<E> {
+impl Master {
     /// Create a new instance from a Unix stream socket.
     pub fn from_stream(sock: SystemStream) -> Self {
-        Self::new(E::from(sock))
+        Self::new(Connection::from(sock))
     }
-}
 
-impl<E: Endpoint<MasterReq>> Master<E> {
     /// Create a new instance.
-    fn new(ep: E) -> Self {
+    fn new(ep: Connection<MasterReq>) -> Self {
         Master {
-            node: Arc::new(Mutex::new(MasterInternal {
-                main_sock: ep,
-                virtio_features: 0,
-                acked_virtio_features: 0,
-                protocol_features: 0,
-                acked_protocol_features: 0,
-                protocol_features_ready: false,
-                hdr_flags: VhostUserHeaderFlag::empty(),
-            })),
+            main_sock: ep,
+            virtio_features: 0,
+            acked_virtio_features: 0,
+            acked_protocol_features: 0,
         }
     }
 
-    fn node(&self) -> MutexGuard<MasterInternal<E>> {
-        self.node.lock().unwrap()
-    }
-
-    /// Create a new vhost-user master endpoint.
+    /// Create a new vhost-user master connection.
     ///
     /// Will retry as the backend may not be ready to accept the connection.
     ///
@@ -71,9 +63,9 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     /// * `path` - path of Unix domain socket listener to connect to
     pub fn connect<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut retry_count = 5;
-        let endpoint = loop {
-            match E::connect(&path) {
-                Ok(endpoint) => break Ok(endpoint),
+        let connection = loop {
+            match Connection::connect(&path) {
+                Ok(connection) => break Ok(connection),
                 Err(e) => match &e {
                     VhostUserError::SocketConnect(why) => {
                         if why.kind() == std::io::ErrorKind::ConnectionRefused && retry_count > 0 {
@@ -89,50 +81,38 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             }
         }?;
 
-        Ok(Self::new(endpoint))
-    }
-
-    /// Set the header flags that should be applied to all following messages.
-    pub fn set_hdr_flags(&self, flags: VhostUserHeaderFlag) {
-        let mut node = self.node();
-        node.hdr_flags = flags;
+        Ok(Self::new(connection))
     }
 
     /// Get a bitmask of supported virtio/vhost features.
-    pub fn get_features(&self) -> Result<u64> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::GET_FEATURES, None)?;
-        let val = node.recv_reply::<VhostUserU64>(&hdr)?;
-        node.virtio_features = val.value;
-        Ok(node.virtio_features)
+    pub fn get_features(&mut self) -> Result<u64> {
+        let hdr = self.send_request_header(MasterReq::GET_FEATURES, None)?;
+        let val = self.recv_reply::<VhostUserU64>(&hdr)?;
+        self.virtio_features = val.value;
+        Ok(self.virtio_features)
     }
 
     /// Inform the vhost subsystem which features to enable.
     /// This should be a subset of supported features from get_features().
-    pub fn set_features(&self, features: u64) -> Result<()> {
-        let mut node = self.node();
+    pub fn set_features(&mut self, features: u64) -> Result<()> {
         let val = VhostUserU64::new(features);
-        let hdr = node.send_request_with_body(MasterReq::SET_FEATURES, &val, None)?;
-        node.acked_virtio_features = features & node.virtio_features;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_FEATURES, &val, None)?;
+        self.acked_virtio_features = features & self.virtio_features;
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the current process as the owner of the vhost backend.
     /// This must be run before any other vhost commands.
     pub fn set_owner(&self) -> Result<()> {
-        // We unwrap() the return value to assert that we are not expecting threads to ever fail
-        // while holding the lock.
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::SET_OWNER, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::SET_OWNER, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Used to be sent to request disabling all rings
     /// This is no longer used.
     pub fn reset_owner(&self) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::RESET_OWNER, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::RESET_OWNER, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the memory map regions on the slave so it can translate the vring
@@ -144,11 +124,10 @@ impl<E: Endpoint<MasterReq>> Master<E> {
 
         let mut ctx = VhostUserMemoryContext::new();
         for region in regions.iter() {
-            // TODO(b/221882601): once mmap handle cross platform story exists, update this null
-            // check.
-            if region.memory_size == 0 || (region.mmap_handle as isize) < 0 {
+            if region.memory_size == 0 || region.mmap_handle == INVALID_DESCRIPTOR {
                 return Err(VhostUserError::InvalidParam);
             }
+
             let reg = VhostUserMemoryRegion {
                 guest_phys_addr: region.guest_phys_addr,
                 memory_size: region.memory_size,
@@ -158,30 +137,27 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             ctx.append(&reg, region.mmap_handle);
         }
 
-        let mut node = self.node();
         let body = VhostUserMemory::new(ctx.regions.len() as u32);
-        let (_, payload, _) = unsafe { ctx.regions.align_to::<u8>() };
-        let hdr = node.send_request_with_payload(
+        let hdr = self.send_request_with_payload(
             MasterReq::SET_MEM_TABLE,
             &body,
-            payload,
+            ctx.regions.as_bytes(),
             Some(ctx.fds.as_slice()),
         )?;
-        node.wait_for_ack(&hdr)
+        self.wait_for_ack(&hdr)
     }
 
     /// Set base address for page modification logging.
     pub fn set_log_base(&self, base: u64, fd: Option<RawDescriptor>) -> Result<()> {
-        let mut node = self.node();
         let val = VhostUserU64::new(base);
 
         let should_have_fd =
-            node.acked_protocol_features & VhostUserProtocolFeatures::LOG_SHMFD.bits() != 0;
+            self.acked_protocol_features & VhostUserProtocolFeatures::LOG_SHMFD.bits() != 0;
         if should_have_fd != fd.is_some() {
             return Err(VhostUserError::InvalidParam);
         }
 
-        let _ = node.send_request_with_body(
+        let _ = self.send_request_with_body(
             MasterReq::SET_LOG_BASE,
             &val,
             fd.as_ref().map(std::slice::from_ref),
@@ -192,46 +168,41 @@ impl<E: Endpoint<MasterReq>> Master<E> {
 
     /// Specify an event file descriptor to signal on log write.
     pub fn set_log_fd(&self, fd: RawDescriptor) -> Result<()> {
-        let mut node = self.node();
         let fds = [fd];
-        let hdr = node.send_request_header(MasterReq::SET_LOG_FD, Some(&fds))?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::SET_LOG_FD, Some(&fds))?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the number of descriptors in the vring.
     pub fn set_vring_num(&self, queue_index: usize, num: u16) -> Result<()> {
-        let mut node = self.node();
         let val = VhostUserVringState::new(queue_index as u32, num.into());
-        let hdr = node.send_request_with_body(MasterReq::SET_VRING_NUM, &val, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_VRING_NUM, &val, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the addresses for a given vring.
     pub fn set_vring_addr(&self, queue_index: usize, config_data: &VringConfigData) -> Result<()> {
-        let mut node = self.node();
         if config_data.flags & !(VhostUserVringAddrFlags::all().bits()) != 0 {
             return Err(VhostUserError::InvalidParam);
         }
 
         let val = VhostUserVringAddr::from_config_data(queue_index as u32, config_data);
-        let hdr = node.send_request_with_body(MasterReq::SET_VRING_ADDR, &val, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_VRING_ADDR, &val, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the first index to look for available descriptors.
     pub fn set_vring_base(&self, queue_index: usize, base: u16) -> Result<()> {
-        let mut node = self.node();
         let val = VhostUserVringState::new(queue_index as u32, base.into());
-        let hdr = node.send_request_with_body(MasterReq::SET_VRING_BASE, &val, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_VRING_BASE, &val, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Get the available vring base offset.
     pub fn get_vring_base(&self, queue_index: usize) -> Result<u32> {
-        let mut node = self.node();
         let req = VhostUserVringState::new(queue_index as u32, 0);
-        let hdr = node.send_request_with_body(MasterReq::GET_VRING_BASE, &req, None)?;
-        let reply = node.recv_reply::<VhostUserVringState>(&hdr)?;
+        let hdr = self.send_request_with_body(MasterReq::GET_VRING_BASE, &req, None)?;
+        let reply = self.recv_reply::<VhostUserVringState>(&hdr)?;
         Ok(reply.num)
     }
 
@@ -241,13 +212,12 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     /// is set when there is no file descriptor in the ancillary data. This signals that polling
     /// will be used instead of waiting for the call.
     pub fn set_vring_call(&self, queue_index: usize, event: &Event) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_fd_for_vring(
+        let hdr = self.send_fd_for_vring(
             MasterReq::SET_VRING_CALL,
             queue_index,
             event.as_raw_descriptor(),
         )?;
-        node.wait_for_ack(&hdr)
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the event that will be signaled by the guest when buffers are available for the host to
@@ -257,13 +227,12 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     /// is set when there is no file descriptor in the ancillary data. This signals that polling
     /// should be used instead of waiting for a kick.
     pub fn set_vring_kick(&self, queue_index: usize, event: &Event) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_fd_for_vring(
+        let hdr = self.send_fd_for_vring(
             MasterReq::SET_VRING_KICK,
             queue_index,
             event.as_raw_descriptor(),
         )?;
-        node.wait_for_ack(&hdr)
+        self.wait_for_ack(&hdr)
     }
 
     /// Set the event that will be signaled by the guest when error happens.
@@ -271,34 +240,30 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     /// Bits (0-7) of the payload contain the vring index. Bit 8 is the invalid FD flag. This flag
     /// is set when there is no file descriptor in the ancillary data.
     pub fn set_vring_err(&self, queue_index: usize, event: &Event) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_fd_for_vring(
+        let hdr = self.send_fd_for_vring(
             MasterReq::SET_VRING_ERR,
             queue_index,
             event.as_raw_descriptor(),
         )?;
-        node.wait_for_ack(&hdr)
+        self.wait_for_ack(&hdr)
     }
 
     /// Put the device to sleep.
     pub fn sleep(&self) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::SLEEP, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::SLEEP, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Wake the device up.
     pub fn wake(&self) -> Result<()> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::WAKE, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::WAKE, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Snapshot the device and receive serialized state of the device.
     pub fn snapshot(&self) -> Result<Vec<u8>> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::SNAPSHOT, None)?;
-        let (success_msg, buf_reply, _) = node.recv_reply_with_payload::<VhostUserSuccess>(&hdr)?;
+        let hdr = self.send_request_header(MasterReq::SNAPSHOT, None)?;
+        let (success_msg, buf_reply, _) = self.recv_reply_with_payload::<VhostUserSuccess>(&hdr)?;
         if !success_msg.success() {
             Err(VhostUserError::SnapshotError(anyhow!(
                 "Device process responded with a failure on SNAPSHOT."
@@ -309,9 +274,7 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     }
 
     /// Restore the device.
-    pub fn restore(&self, data_bytes: &[u8], queue_evts: Option<Vec<Event>>) -> Result<()> {
-        let mut node = self.node();
-
+    pub fn restore(&mut self, data_bytes: &[u8], queue_evts: Option<Vec<Event>>) -> Result<()> {
         let body = VhostUserEmptyMsg;
 
         let queue_evt_fds: Option<Vec<RawDescriptor>> = queue_evts.as_ref().map(|queue_evts| {
@@ -321,13 +284,13 @@ impl<E: Endpoint<MasterReq>> Master<E> {
                 .collect()
         });
 
-        let hdr = node.send_request_with_payload(
+        let hdr = self.send_request_with_payload(
             MasterReq::RESTORE,
             &body,
             data_bytes,
             queue_evt_fds.as_deref(),
         )?;
-        let reply = node.recv_reply::<VhostUserSuccess>(&hdr)?;
+        let reply = self.recv_reply::<VhostUserSuccess>(&hdr)?;
         if !reply.success() {
             Err(VhostUserError::RestoreError(anyhow!(
                 "Device process responded with a failure on RESTORE."
@@ -338,17 +301,15 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     }
 
     /// Get the protocol feature bitmask from the underlying vhost implementation.
-    pub fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures> {
-        let mut node = self.node();
-        if node.virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
+    pub fn get_protocol_features(&self) -> Result<VhostUserProtocolFeatures> {
+        if self.virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
-        let hdr = node.send_request_header(MasterReq::GET_PROTOCOL_FEATURES, None)?;
-        let val = node.recv_reply::<VhostUserU64>(&hdr)?;
-        node.protocol_features = val.value;
+        let hdr = self.send_request_header(MasterReq::GET_PROTOCOL_FEATURES, None)?;
+        let val = self.recv_reply::<VhostUserU64>(&hdr)?;
         // Should we support forward compatibility?
         // If so just mask out unrecognized flags instead of return errors.
-        match VhostUserProtocolFeatures::from_bits(node.protocol_features) {
+        match VhostUserProtocolFeatures::from_bits(val.value) {
             Some(val) => Ok(val),
             None => Err(VhostUserError::InvalidMessage),
         }
@@ -356,8 +317,7 @@ impl<E: Endpoint<MasterReq>> Master<E> {
 
     /// Enable protocol features in the underlying vhost implementation.
     pub fn set_protocol_features(&mut self, features: VhostUserProtocolFeatures) -> Result<()> {
-        let mut node = self.node();
-        if node.virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
+        if self.virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
         if features.contains(VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS)
@@ -366,23 +326,21 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             return Err(VhostUserError::FeatureMismatch);
         }
         let val = VhostUserU64::new(features.bits());
-        let hdr = node.send_request_with_body(MasterReq::SET_PROTOCOL_FEATURES, &val, None)?;
+        let hdr = self.send_request_with_body(MasterReq::SET_PROTOCOL_FEATURES, &val, None)?;
         // Don't wait for ACK here because the protocol feature negotiation process hasn't been
         // completed yet.
-        node.acked_protocol_features = features.bits();
-        node.protocol_features_ready = true;
-        node.wait_for_ack(&hdr)
+        self.acked_protocol_features = features.bits();
+        self.wait_for_ack(&hdr)
     }
 
     /// Query how many queues the backend supports.
     pub fn get_queue_num(&self) -> Result<u64> {
-        let mut node = self.node();
-        if !node.is_feature_mq_available() {
+        if !self.is_feature_mq_available() {
             return Err(VhostUserError::InvalidOperation);
         }
 
-        let hdr = node.send_request_header(MasterReq::GET_QUEUE_NUM, None)?;
-        let val = node.recv_reply::<VhostUserU64>(&hdr)?;
+        let hdr = self.send_request_header(MasterReq::GET_QUEUE_NUM, None)?;
+        let val = self.recv_reply::<VhostUserU64>(&hdr)?;
         if val.value > VHOST_USER_MAX_VRINGS {
             return Err(VhostUserError::InvalidMessage);
         }
@@ -394,21 +352,20 @@ impl<E: Endpoint<MasterReq>> Master<E> {
     /// Slave must not pass data to/from the backend until ring is enabled by
     /// VHOST_USER_SET_VRING_ENABLE with parameter 1, or after it has been
     /// disabled by VHOST_USER_SET_VRING_ENABLE with parameter 0.
-    pub fn set_vring_enable(&mut self, queue_index: usize, enable: bool) -> Result<()> {
-        let mut node = self.node();
+    pub fn set_vring_enable(&self, queue_index: usize, enable: bool) -> Result<()> {
         // set_vring_enable() is supported only when PROTOCOL_FEATURES has been enabled.
-        if node.acked_virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
+        if self.acked_virtio_features & 1 << VHOST_USER_F_PROTOCOL_FEATURES == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
 
         let val = VhostUserVringState::new(queue_index as u32, enable.into());
-        let hdr = node.send_request_with_body(MasterReq::SET_VRING_ENABLE, &val, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_VRING_ENABLE, &val, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Fetch the contents of the virtio device configuration space.
     pub fn get_config(
-        &mut self,
+        &self,
         offset: u32,
         size: u32,
         flags: VhostUserConfigFlags,
@@ -419,19 +376,18 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             return Err(VhostUserError::InvalidParam);
         }
 
-        let mut node = self.node();
         // depends on VhostUserProtocolFeatures::CONFIG
-        if node.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
 
         // vhost-user spec states that:
         // "Master payload: virtio device config space"
         // "Slave payload: virtio device config space"
-        let hdr = node.send_request_with_payload(MasterReq::GET_CONFIG, &body, buf, None)?;
+        let hdr = self.send_request_with_payload(MasterReq::GET_CONFIG, &body, buf, None)?;
         let (body_reply, buf_reply, rfds) =
-            node.recv_reply_with_payload::<VhostUserConfig>(&hdr)?;
-        if rfds.is_some() {
+            self.recv_reply_with_payload::<VhostUserConfig>(&hdr)?;
+        if !rfds.is_empty() {
             return Err(VhostUserError::InvalidMessage);
         } else if body_reply.size == 0 {
             return Err(VhostUserError::SlaveInternalError);
@@ -447,12 +403,7 @@ impl<E: Endpoint<MasterReq>> Master<E> {
 
     /// Change the virtio device configuration space. It also can be used for live migration on the
     /// destination host to set readonly configuration space fields.
-    pub fn set_config(
-        &mut self,
-        offset: u32,
-        flags: VhostUserConfigFlags,
-        buf: &[u8],
-    ) -> Result<()> {
+    pub fn set_config(&self, offset: u32, flags: VhostUserConfigFlags, buf: &[u8]) -> Result<()> {
         let body = VhostUserConfig::new(
             offset,
             buf.len()
@@ -464,54 +415,46 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             return Err(VhostUserError::InvalidParam);
         }
 
-        let mut node = self.node();
         // depends on VhostUserProtocolFeatures::CONFIG
-        if node.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
 
-        let hdr = node.send_request_with_payload(MasterReq::SET_CONFIG, &body, buf, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_payload(MasterReq::SET_CONFIG, &body, buf, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Setup slave communication channel.
-    pub fn set_slave_request_fd(&mut self, fd: &dyn AsRawDescriptor) -> Result<()> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::SLAVE_REQ.bits() == 0 {
+    pub fn set_slave_request_fd(&self, fd: &dyn AsRawDescriptor) -> Result<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::SLAVE_REQ.bits() == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
         let fds = [fd.as_raw_descriptor()];
-        let hdr = node.send_request_header(MasterReq::SET_SLAVE_REQ_FD, Some(&fds))?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_header(MasterReq::SET_SLAVE_REQ_FD, Some(&fds))?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Retrieve shared buffer for inflight I/O tracking.
     pub fn get_inflight_fd(
-        &mut self,
+        &self,
         inflight: &VhostUserInflight,
     ) -> Result<(VhostUserInflight, File)> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::INFLIGHT_SHMFD.bits() == 0 {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::INFLIGHT_SHMFD.bits() == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
 
-        let hdr = node.send_request_with_body(MasterReq::GET_INFLIGHT_FD, inflight, None)?;
-        let (inflight, files) = node.recv_reply_with_files::<VhostUserInflight>(&hdr)?;
+        let hdr = self.send_request_with_body(MasterReq::GET_INFLIGHT_FD, inflight, None)?;
+        let (inflight, files) = self.recv_reply_with_files::<VhostUserInflight>(&hdr)?;
 
-        match take_single_file(files) {
+        match into_single_file(files) {
             Some(file) => Ok((inflight, file)),
             None => Err(VhostUserError::IncorrectFds),
         }
     }
 
     /// Set shared buffer for inflight I/O tracking.
-    pub fn set_inflight_fd(
-        &mut self,
-        inflight: &VhostUserInflight,
-        fd: RawDescriptor,
-    ) -> Result<()> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::INFLIGHT_SHMFD.bits() == 0 {
+    pub fn set_inflight_fd(&self, inflight: &VhostUserInflight, fd: RawDescriptor) -> Result<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::INFLIGHT_SHMFD.bits() == 0 {
             return Err(VhostUserError::InvalidOperation);
         }
 
@@ -523,33 +466,31 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             return Err(VhostUserError::InvalidParam);
         }
 
-        let hdr = node.send_request_with_body(MasterReq::SET_INFLIGHT_FD, inflight, Some(&[fd]))?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::SET_INFLIGHT_FD, inflight, Some(&[fd]))?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Query the maximum amount of memory slots supported by the backend.
-    pub fn get_max_mem_slots(&mut self) -> Result<u64> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
+    pub fn get_max_mem_slots(&self) -> Result<u64> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
         {
             return Err(VhostUserError::InvalidOperation);
         }
 
-        let hdr = node.send_request_header(MasterReq::GET_MAX_MEM_SLOTS, None)?;
-        let val = node.recv_reply::<VhostUserU64>(&hdr)?;
+        let hdr = self.send_request_header(MasterReq::GET_MAX_MEM_SLOTS, None)?;
+        let val = self.recv_reply::<VhostUserU64>(&hdr)?;
 
         Ok(val.value)
     }
 
     /// Add a new guest memory mapping for vhost to use.
-    pub fn add_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
+    pub fn add_mem_region(&self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
         {
             return Err(VhostUserError::InvalidOperation);
         }
-        // TODO(b/221882601): once mmap handle cross platform story exists, update this null check.
-        if region.memory_size == 0 || (region.mmap_handle as isize) < 0 {
+
+        if region.memory_size == 0 || region.mmap_handle == INVALID_DESCRIPTOR {
             return Err(VhostUserError::InvalidParam);
         }
 
@@ -560,14 +501,13 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             region.mmap_offset,
         );
         let fds = [region.mmap_handle];
-        let hdr = node.send_request_with_body(MasterReq::ADD_MEM_REG, &body, Some(&fds))?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::ADD_MEM_REG, &body, Some(&fds))?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Remove a guest memory mapping from vhost.
-    pub fn remove_mem_region(&mut self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
-        let mut node = self.node();
-        if node.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
+    pub fn remove_mem_region(&self, region: &VhostUserMemoryRegionInfo) -> Result<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits() == 0
         {
             return Err(VhostUserError::InvalidOperation);
         }
@@ -581,17 +521,16 @@ impl<E: Endpoint<MasterReq>> Master<E> {
             region.userspace_addr,
             region.mmap_offset,
         );
-        let hdr = node.send_request_with_body(MasterReq::REM_MEM_REG, &body, None)?;
-        node.wait_for_ack(&hdr)
+        let hdr = self.send_request_with_body(MasterReq::REM_MEM_REG, &body, None)?;
+        self.wait_for_ack(&hdr)
     }
 
     /// Gets the shared memory regions used by the device.
     pub fn get_shared_memory_regions(&self) -> Result<Vec<VhostSharedMemoryRegion>> {
-        let mut node = self.node();
-        let hdr = node.send_request_header(MasterReq::GET_SHARED_MEMORY_REGIONS, None)?;
-        let (body_reply, buf_reply, rfds) = node.recv_reply_with_payload::<VhostUserU64>(&hdr)?;
+        let hdr = self.send_request_header(MasterReq::GET_SHARED_MEMORY_REGIONS, None)?;
+        let (body_reply, buf_reply, rfds) = self.recv_reply_with_payload::<VhostUserU64>(&hdr)?;
         let struct_size = mem::size_of::<VhostSharedMemoryRegion>();
-        if rfds.is_some() || buf_reply.len() != body_reply.value as usize * struct_size {
+        if !rfds.is_empty() || buf_reply.len() != body_reply.value as usize * struct_size {
             return Err(VhostUserError::InvalidMessage);
         }
         let mut regions = Vec::new();
@@ -605,14 +544,136 @@ impl<E: Endpoint<MasterReq>> Master<E> {
         }
         Ok(regions)
     }
-}
 
-impl<E: Endpoint<MasterReq> + AsRawDescriptor> AsRawDescriptor for Master<E> {
-    fn as_raw_descriptor(&self) -> RawDescriptor {
-        let node = self.node();
-        // TODO(b/221882601): why is this here? The underlying Tube needs to use a read notifier
-        // if this is for polling.
-        node.main_sock.as_raw_descriptor()
+    fn send_request_header(
+        &self,
+        code: MasterReq,
+        fds: Option<&[RawDescriptor]>,
+    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
+        let hdr = self.new_request_header(code, 0);
+        self.main_sock.send_header_only_message(&hdr, fds)?;
+        Ok(hdr)
+    }
+
+    fn send_request_with_body<T: Sized + AsBytes>(
+        &self,
+        code: MasterReq,
+        msg: &T,
+        fds: Option<&[RawDescriptor]>,
+    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
+        let hdr = self.new_request_header(code, mem::size_of::<T>() as u32);
+        self.main_sock.send_message(&hdr, msg, fds)?;
+        Ok(hdr)
+    }
+
+    fn send_request_with_payload<T: Sized + AsBytes>(
+        &self,
+        code: MasterReq,
+        msg: &T,
+        payload: &[u8],
+        fds: Option<&[RawDescriptor]>,
+    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
+        if let Some(fd_arr) = fds {
+            if fd_arr.len() > MAX_ATTACHED_FD_ENTRIES {
+                return Err(VhostUserError::InvalidParam);
+            }
+        }
+        let len = mem::size_of::<T>()
+            .checked_add(payload.len())
+            .ok_or(VhostUserError::OversizedMsg)?;
+        let hdr = self.new_request_header(
+            code,
+            len.try_into().map_err(VhostUserError::InvalidCastToInt)?,
+        );
+        self.main_sock
+            .send_message_with_payload(&hdr, msg, payload, fds)?;
+        Ok(hdr)
+    }
+
+    fn send_fd_for_vring(
+        &self,
+        code: MasterReq,
+        queue_index: usize,
+        fd: RawDescriptor,
+    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
+        // Bits (0-7) of the payload contain the vring index. Bit 8 is the invalid FD flag.
+        // This flag is set when there is no file descriptor in the ancillary data. This signals
+        // that polling will be used instead of waiting for the call.
+        let msg = VhostUserU64::new(queue_index as u64);
+        let hdr = self.new_request_header(code, mem::size_of::<VhostUserU64>() as u32);
+        self.main_sock.send_message(&hdr, &msg, Some(&[fd]))?;
+        Ok(hdr)
+    }
+
+    fn recv_reply<T: Sized + FromBytes + AsBytes + Default + VhostUserMsgValidator>(
+        &self,
+        hdr: &VhostUserMsgHeader<MasterReq>,
+    ) -> VhostUserResult<T> {
+        if hdr.is_reply() {
+            return Err(VhostUserError::InvalidParam);
+        }
+        let (reply, body, rfds) = self.main_sock.recv_message::<T>()?;
+        if !reply.is_reply_for(hdr) || !rfds.is_empty() || !body.is_valid() {
+            return Err(VhostUserError::InvalidMessage);
+        }
+        Ok(body)
+    }
+
+    fn recv_reply_with_files<T: Sized + AsBytes + FromBytes + Default + VhostUserMsgValidator>(
+        &self,
+        hdr: &VhostUserMsgHeader<MasterReq>,
+    ) -> VhostUserResult<(T, Vec<File>)> {
+        if hdr.is_reply() {
+            return Err(VhostUserError::InvalidParam);
+        }
+
+        let (reply, body, files) = self.main_sock.recv_message::<T>()?;
+        if !reply.is_reply_for(hdr) || files.is_empty() || !body.is_valid() {
+            return Err(VhostUserError::InvalidMessage);
+        }
+        Ok((body, files))
+    }
+
+    fn recv_reply_with_payload<T: Sized + AsBytes + FromBytes + Default + VhostUserMsgValidator>(
+        &self,
+        hdr: &VhostUserMsgHeader<MasterReq>,
+    ) -> VhostUserResult<(T, Vec<u8>, Vec<File>)> {
+        if hdr.is_reply() {
+            return Err(VhostUserError::InvalidParam);
+        }
+
+        let (reply, body, buf, files) = self.main_sock.recv_message_with_payload::<T>()?;
+        if !reply.is_reply_for(hdr) || !files.is_empty() || !body.is_valid() {
+            return Err(VhostUserError::InvalidMessage);
+        }
+
+        Ok((body, buf, files))
+    }
+
+    fn wait_for_ack(&self, hdr: &VhostUserMsgHeader<MasterReq>) -> VhostUserResult<()> {
+        if self.acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() == 0
+            || !hdr.is_need_reply()
+        {
+            return Ok(());
+        }
+
+        let (reply, body, rfds) = self.main_sock.recv_message::<VhostUserU64>()?;
+        if !reply.is_reply_for(hdr) || !rfds.is_empty() || !body.is_valid() {
+            return Err(VhostUserError::InvalidMessage);
+        }
+        if body.value != 0 {
+            return Err(VhostUserError::SlaveInternalError);
+        }
+        Ok(())
+    }
+
+    fn is_feature_mq_available(&self) -> bool {
+        self.acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0
+    }
+
+    #[inline]
+    fn new_request_header(&self, request: MasterReq, size: u32) -> VhostUserMsgHeader<MasterReq> {
+        VhostUserMsgHeader::new(request, 0x1, size)
     }
 }
 
@@ -639,172 +700,21 @@ impl VhostUserMemoryContext {
     }
 }
 
-struct MasterInternal<E: Endpoint<MasterReq>> {
-    // Used to send requests to the slave.
-    main_sock: E,
-    // Cached virtio features from the slave.
-    virtio_features: u64,
-    // Cached acked virtio features from the driver.
-    acked_virtio_features: u64,
-    // Cached vhost-user protocol features from the slave.
-    protocol_features: u64,
-    // Cached vhost-user protocol features.
-    acked_protocol_features: u64,
-    // Cached vhost-user protocol features are ready to use.
-    protocol_features_ready: bool,
-    // List of header flags.
-    hdr_flags: VhostUserHeaderFlag,
-}
-
-impl<E: Endpoint<MasterReq>> MasterInternal<E> {
-    fn send_request_header(
-        &mut self,
-        code: MasterReq,
-        fds: Option<&[RawDescriptor]>,
-    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
-        let hdr = self.new_request_header(code, 0);
-        self.main_sock.send_header(&hdr, fds)?;
-        Ok(hdr)
-    }
-
-    fn send_request_with_body<T: Sized + AsBytes>(
-        &mut self,
-        code: MasterReq,
-        msg: &T,
-        fds: Option<&[RawDescriptor]>,
-    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
-        let hdr = self.new_request_header(code, mem::size_of::<T>() as u32);
-        self.main_sock.send_message(&hdr, msg, fds)?;
-        Ok(hdr)
-    }
-
-    fn send_request_with_payload<T: Sized + AsBytes>(
-        &mut self,
-        code: MasterReq,
-        msg: &T,
-        payload: &[u8],
-        fds: Option<&[RawDescriptor]>,
-    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
-        if let Some(fd_arr) = fds {
-            if fd_arr.len() > MAX_ATTACHED_FD_ENTRIES {
-                return Err(VhostUserError::InvalidParam);
-            }
-        }
-        let len = mem::size_of::<T>()
-            .checked_add(payload.len())
-            .ok_or(VhostUserError::OversizedMsg)?;
-        let hdr = self.new_request_header(
-            code,
-            len.try_into().map_err(VhostUserError::InvalidCastToInt)?,
-        );
-        self.main_sock
-            .send_message_with_payload(&hdr, msg, payload, fds)?;
-        Ok(hdr)
-    }
-
-    fn send_fd_for_vring(
-        &mut self,
-        code: MasterReq,
-        queue_index: usize,
-        fd: RawDescriptor,
-    ) -> VhostUserResult<VhostUserMsgHeader<MasterReq>> {
-        // Bits (0-7) of the payload contain the vring index. Bit 8 is the invalid FD flag.
-        // This flag is set when there is no file descriptor in the ancillary data. This signals
-        // that polling will be used instead of waiting for the call.
-        let msg = VhostUserU64::new(queue_index as u64);
-        let hdr = self.new_request_header(code, mem::size_of::<VhostUserU64>() as u32);
-        self.main_sock.send_message(&hdr, &msg, Some(&[fd]))?;
-        Ok(hdr)
-    }
-
-    fn recv_reply<T: Sized + FromBytes + AsBytes + Default + VhostUserMsgValidator>(
-        &mut self,
-        hdr: &VhostUserMsgHeader<MasterReq>,
-    ) -> VhostUserResult<T> {
-        if hdr.is_reply() {
-            return Err(VhostUserError::InvalidParam);
-        }
-        let (reply, body, rfds) = self.main_sock.recv_body::<T>()?;
-        if !reply.is_reply_for(hdr) || rfds.is_some() || !body.is_valid() {
-            return Err(VhostUserError::InvalidMessage);
-        }
-        Ok(body)
-    }
-
-    fn recv_reply_with_files<T: Sized + AsBytes + FromBytes + Default + VhostUserMsgValidator>(
-        &mut self,
-        hdr: &VhostUserMsgHeader<MasterReq>,
-    ) -> VhostUserResult<(T, Option<Vec<File>>)> {
-        if hdr.is_reply() {
-            return Err(VhostUserError::InvalidParam);
-        }
-
-        let (reply, body, files) = self.main_sock.recv_body::<T>()?;
-        if !reply.is_reply_for(hdr) || files.is_none() || !body.is_valid() {
-            return Err(VhostUserError::InvalidMessage);
-        }
-        Ok((body, files))
-    }
-
-    fn recv_reply_with_payload<T: Sized + AsBytes + FromBytes + Default + VhostUserMsgValidator>(
-        &mut self,
-        hdr: &VhostUserMsgHeader<MasterReq>,
-    ) -> VhostUserResult<(T, Vec<u8>, Option<Vec<File>>)> {
-        if hdr.is_reply() {
-            return Err(VhostUserError::InvalidParam);
-        }
-
-        let (reply, body, buf, files) = self.main_sock.recv_payload_into_buf::<T>()?;
-        if !reply.is_reply_for(hdr) || files.is_some() || !body.is_valid() {
-            return Err(VhostUserError::InvalidMessage);
-        }
-
-        Ok((body, buf, files))
-    }
-
-    fn wait_for_ack(&mut self, hdr: &VhostUserMsgHeader<MasterReq>) -> VhostUserResult<()> {
-        if self.acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() == 0
-            || !hdr.is_need_reply()
-        {
-            return Ok(());
-        }
-
-        let (reply, body, rfds) = self.main_sock.recv_body::<VhostUserU64>()?;
-        if !reply.is_reply_for(hdr) || rfds.is_some() || !body.is_valid() {
-            return Err(VhostUserError::InvalidMessage);
-        }
-        if body.value != 0 {
-            return Err(VhostUserError::SlaveInternalError);
-        }
-        Ok(())
-    }
-
-    fn is_feature_mq_available(&self) -> bool {
-        self.acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0
-    }
-
-    #[inline]
-    fn new_request_header(&self, request: MasterReq, size: u32) -> VhostUserMsgHeader<MasterReq> {
-        VhostUserMsgHeader::new(request, self.hdr_flags.bits() | 0x1, size)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use base::INVALID_DESCRIPTOR;
+    use tempfile::tempfile;
 
     use super::*;
     use crate::connection::tests::create_pair;
-    use crate::connection::tests::TestEndpoint;
-    use crate::connection::tests::TestMaster;
 
     const BUFFER_SIZE: usize = 0x1001;
 
     #[test]
     fn create_master() {
-        let (master, mut slave) = create_pair();
+        let (master, slave) = create_pair();
 
-        assert!(master.as_raw_descriptor() != INVALID_DESCRIPTOR);
+        assert!(master.main_sock.as_raw_descriptor() != INVALID_DESCRIPTOR);
         // Send two messages continuously
         master.set_owner().unwrap();
         master.reset_owner().unwrap();
@@ -813,25 +723,25 @@ mod tests {
         assert_eq!(hdr.get_code(), Ok(MasterReq::SET_OWNER));
         assert_eq!(hdr.get_size(), 0);
         assert_eq!(hdr.get_version(), 0x1);
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         let (hdr, rfds) = slave.recv_header().unwrap();
         assert_eq!(hdr.get_code(), Ok(MasterReq::RESET_OWNER));
         assert_eq!(hdr.get_size(), 0);
         assert_eq!(hdr.get_version(), 0x1);
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
     }
 
     #[test]
     fn test_features() {
-        let (master, mut peer) = create_pair();
+        let (mut master, peer) = create_pair();
 
         master.set_owner().unwrap();
         let (hdr, rfds) = peer.recv_header().unwrap();
         assert_eq!(hdr.get_code(), Ok(MasterReq::SET_OWNER));
         assert_eq!(hdr.get_size(), 0);
         assert_eq!(hdr.get_version(), 0x1);
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_FEATURES, 0x4, 8);
         let msg = VhostUserU64::new(0x15);
@@ -839,14 +749,14 @@ mod tests {
         let features = master.get_features().unwrap();
         assert_eq!(features, 0x15u64);
         let (_hdr, rfds) = peer.recv_header().unwrap();
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         let hdr = VhostUserMsgHeader::new(MasterReq::SET_FEATURES, 0x4, 8);
         let msg = VhostUserU64::new(0x15);
         peer.send_message(&hdr, &msg, None).unwrap();
         master.set_features(0x15).unwrap();
-        let (_hdr, msg, rfds) = peer.recv_body::<VhostUserU64>().unwrap();
-        assert!(rfds.is_none());
+        let (_hdr, msg, rfds) = peer.recv_message::<VhostUserU64>().unwrap();
+        assert!(rfds.is_empty());
         let val = msg.value;
         assert_eq!(val, 0x15);
 
@@ -858,12 +768,12 @@ mod tests {
 
     #[test]
     fn test_protocol_features() {
-        let (mut master, mut peer) = create_pair();
+        let (mut master, peer) = create_pair();
 
         master.set_owner().unwrap();
         let (hdr, rfds) = peer.recv_header().unwrap();
         assert_eq!(hdr.get_code(), Ok(MasterReq::SET_OWNER));
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         assert!(master.get_protocol_features().is_err());
         assert!(master
@@ -877,11 +787,11 @@ mod tests {
         let features = master.get_features().unwrap();
         assert_eq!(features, vfeatures);
         let (_hdr, rfds) = peer.recv_header().unwrap();
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         master.set_features(vfeatures).unwrap();
-        let (_hdr, msg, rfds) = peer.recv_body::<VhostUserU64>().unwrap();
-        assert!(rfds.is_none());
+        let (_hdr, msg, rfds) = peer.recv_message::<VhostUserU64>().unwrap();
+        assert!(rfds.is_empty());
         let val = msg.value;
         assert_eq!(val, vfeatures);
 
@@ -892,11 +802,11 @@ mod tests {
         let features = master.get_protocol_features().unwrap();
         assert_eq!(features, pfeatures);
         let (_hdr, rfds) = peer.recv_header().unwrap();
-        assert!(rfds.is_none());
+        assert!(rfds.is_empty());
 
         master.set_protocol_features(pfeatures).unwrap();
-        let (_hdr, msg, rfds) = peer.recv_body::<VhostUserU64>().unwrap();
-        assert!(rfds.is_none());
+        let (_hdr, msg, rfds) = peer.recv_message::<VhostUserU64>().unwrap();
+        assert!(rfds.is_empty());
         let val = msg.value;
         assert_eq!(val, pfeatures.bits());
 
@@ -915,13 +825,9 @@ mod tests {
             .set_config(0x100, VhostUserConfigFlags::WRITABLE, &buf[0..4])
             .unwrap_err();
 
-        {
-            let mut node = master.node();
-            node.virtio_features = 0xffff_ffff;
-            node.acked_virtio_features = 0xffff_ffff;
-            node.protocol_features = 0xffff_ffff;
-            node.acked_protocol_features = 0xffff_ffff;
-        }
+        master.virtio_features = 0xffff_ffff;
+        master.acked_virtio_features = 0xffff_ffff;
+        master.acked_protocol_features = 0xffff_ffff;
 
         master
             .set_config(0, VhostUserConfigFlags::WRITABLE, &buf[0..4])
@@ -951,22 +857,19 @@ mod tests {
             .unwrap_err();
     }
 
-    fn create_pair2() -> (TestMaster, TestEndpoint) {
-        let (master, peer) = create_pair();
-        {
-            let mut node = master.node();
-            node.virtio_features = 0xffff_ffff;
-            node.acked_virtio_features = 0xffff_ffff;
-            node.protocol_features = 0xffff_ffff;
-            node.acked_protocol_features = 0xffff_ffff;
-        }
+    fn create_pair2() -> (Master, Connection<MasterReq>) {
+        let (mut master, peer) = create_pair();
+
+        master.virtio_features = 0xffff_ffff;
+        master.acked_virtio_features = 0xffff_ffff;
+        master.acked_protocol_features = 0xffff_ffff;
 
         (master, peer)
     }
 
     #[test]
     fn test_master_get_config_negative0() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let mut hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -988,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative1() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let mut hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1009,7 +912,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative2() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1023,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative3() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1044,7 +947,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative4() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1065,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative5() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1086,7 +989,7 @@ mod tests {
 
     #[test]
     fn test_master_get_config_negative6() {
-        let (mut master, mut peer) = create_pair2();
+        let (master, peer) = create_pair2();
         let buf = vec![0x0; BUFFER_SIZE];
 
         let hdr = VhostUserMsgHeader::new(MasterReq::GET_CONFIG, 0x4, 16);
@@ -1109,8 +1012,23 @@ mod tests {
     fn test_maset_set_mem_table_failure() {
         let (master, _peer) = create_pair2();
 
+        // set_mem_table() with 0 regions is invalid
         master.set_mem_table(&[]).unwrap_err();
-        let tables = vec![VhostUserMemoryRegionInfo::default(); MAX_ATTACHED_FD_ENTRIES + 1];
+
+        // set_mem_table() with more than MAX_ATTACHED_FD_ENTRIES is invalid
+        let files: Vec<File> = (0..MAX_ATTACHED_FD_ENTRIES + 1)
+            .map(|_| tempfile().unwrap())
+            .collect();
+        let tables: Vec<VhostUserMemoryRegionInfo> = files
+            .iter()
+            .map(|f| VhostUserMemoryRegionInfo {
+                guest_phys_addr: 0,
+                memory_size: 0x100000,
+                userspace_addr: 0x800000,
+                mmap_offset: 0,
+                mmap_handle: f.as_raw_descriptor(),
+            })
+            .collect();
         master.set_mem_table(&tables).unwrap_err();
     }
 }

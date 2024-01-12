@@ -13,9 +13,9 @@ use std::path::PathBuf;
 
 use base::error;
 use base::open_file_or_duplicate;
-#[cfg(windows)]
-use base::platform::Console as WinConsole;
 use base::syslog;
+#[cfg(windows)]
+use base::windows::Console as WinConsole;
 use base::AsRawDescriptor;
 use base::Event;
 use base::FileSync;
@@ -143,6 +143,7 @@ pub struct SerialParameters {
     #[serde(rename = "type")]
     pub type_: SerialType,
     pub hardware: SerialHardware,
+    pub name: Option<String>,
     pub path: Option<PathBuf>,
     pub input: Option<PathBuf>,
     #[serde(default = "serial_parameters_default_num")]
@@ -157,6 +158,15 @@ pub struct SerialParameters {
         default = "serial_parameters_default_debugcon_port"
     )]
     pub debugcon_port: u16,
+}
+
+/// Temporary structure containing the parameters of a serial port for easy passing to
+/// `SerialDevice::new`.
+#[derive(Default)]
+pub struct SerialOptions {
+    pub name: Option<String>,
+    pub out_timestamp: bool,
+    pub console: bool,
 }
 
 impl SerialParameters {
@@ -235,7 +245,11 @@ impl SerialParameters {
             input,
             output,
             sync,
-            self.out_timestamp,
+            SerialOptions {
+                name: self.name.clone(),
+                out_timestamp: self.out_timestamp,
+                console: self.console,
+            },
             keep_rds.to_vec(),
         ))
     }
@@ -260,6 +274,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Sink,
                 hardware: SerialHardware::Serial,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,
@@ -280,7 +295,7 @@ mod tests {
         assert_eq!(params.type_, SerialType::Sink);
         let params = from_serial_arg("type=syslog").unwrap();
         assert_eq!(params.type_, SerialType::Syslog);
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let opt = "type=unix";
         #[cfg(windows)]
         let opt = "type=namedpipe";
@@ -368,6 +383,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::VirtioConsole,
+                name: None,
                 path: Some("/some/path".into()),
                 input: Some("/some/input".into()),
                 num: 5,

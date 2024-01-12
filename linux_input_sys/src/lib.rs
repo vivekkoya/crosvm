@@ -9,11 +9,11 @@ pub mod constants;
 use std::mem::size_of;
 
 use constants::*;
-use data_model::zerocopy_from_slice;
 use data_model::Le16;
 use data_model::SLe32;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 /// Allows a raw input event of the implementor's type to be decoded into
 /// a virtio_input_event.
@@ -22,7 +22,7 @@ pub trait InputEventDecoder {
     fn decode(data: &[u8]) -> virtio_input_event;
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, FromZeroes, FromBytes, AsBytes)]
 #[repr(C)]
 pub struct input_event {
     pub timestamp_fields: [u64; 2],
@@ -46,11 +46,7 @@ impl InputEventDecoder for input_event {
     const SIZE: usize = size_of::<Self>();
 
     fn decode(data: &[u8]) -> virtio_input_event {
-        #[repr(align(8))]
-        #[derive(FromBytes)]
-        struct Aligner([u8; input_event::SIZE]);
-        let data_aligned = zerocopy_from_slice::<Aligner>(data).unwrap();
-        let e: &input_event = zerocopy_from_slice(data_aligned.0.as_bytes()).unwrap();
+        let e = input_event::read_from(data).unwrap();
         virtio_input_event {
             type_: Le16::from(e.type_),
             code: Le16::from(e.code),
@@ -59,7 +55,7 @@ impl InputEventDecoder for input_event {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, AsBytes, FromZeroes, FromBytes)]
 #[repr(C)]
 pub struct virtio_input_event {
     pub type_: Le16,
@@ -71,11 +67,7 @@ impl InputEventDecoder for virtio_input_event {
     const SIZE: usize = size_of::<Self>();
 
     fn decode(data: &[u8]) -> virtio_input_event {
-        #[repr(align(4))]
-        #[derive(FromBytes)]
-        struct Aligner([u8; virtio_input_event::SIZE]);
-        let data_aligned = zerocopy_from_slice::<Aligner>(data).unwrap();
-        *zerocopy_from_slice(data_aligned.0.as_bytes()).unwrap()
+        virtio_input_event::read_from(data).unwrap()
     }
 }
 
@@ -149,20 +141,39 @@ impl virtio_input_event {
 
     #[inline]
     pub fn touch(has_contact: bool) -> virtio_input_event {
-        Self::key(BTN_TOUCH, has_contact)
+        Self::key(BTN_TOUCH, has_contact, false)
     }
 
     #[inline]
     pub fn finger_tool(active: bool) -> virtio_input_event {
-        Self::key(BTN_TOOL_FINGER, active)
+        Self::key(BTN_TOOL_FINGER, active, false)
     }
 
+    /// Repeated keys must set the `repeat` option if the key was already down, or repeated keys
+    /// will not be seen correctly by the guest.
     #[inline]
-    pub fn key(code: u16, pressed: bool) -> virtio_input_event {
+    pub fn key(code: u16, down: bool, repeat: bool) -> virtio_input_event {
         virtio_input_event {
             type_: Le16::from(EV_KEY),
             code: Le16::from(code),
-            value: SLe32::from(i32::from(pressed)),
+            value: SLe32::from(match (down, repeat) {
+                (true, true) => 2,
+                (true, false) => 1,
+                // repeat is not meaningful for key up events.
+                _ => 0,
+            }),
         }
+    }
+
+    /// If the event is EV_LED for the given LED code, return if it is on.
+    pub fn get_led_state(&self, led_code: u16) -> Option<bool> {
+        if self.type_ == EV_LED && self.code == led_code {
+            return match self.value.to_native() {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            };
+        }
+        None
     }
 }

@@ -4,7 +4,7 @@
 
 //! Testing virtio-block.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 use std::time;
 
@@ -126,10 +126,7 @@ fn run_vhost_user_test(cmd_type: CmdType, config: VmConfig) {
     let vu_config = create_vu_block_config(cmd_type, socket.path(), disk.path());
     let _vu_device = VhostUserBackend::new(vu_config).unwrap();
 
-    let config = config.extra_args(vec![
-        "--vhost-user-blk".to_string(),
-        socket.path().to_str().unwrap().to_string(),
-    ]);
+    let config = config.with_vhost_user("block", socket.path());
     let mut vm = TestVm::new(config).unwrap();
     assert_eq!(
         vm.exec_in_guest("mount -t ext4 /dev/vdb /mnt && echo 42")

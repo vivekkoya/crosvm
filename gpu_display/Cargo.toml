@@ -18,7 +18,7 @@ remain = "*"
 thiserror = "*"
 cfg-if = "*"
 serde = { version = "1", features = [ "derive" ] }
-zerocopy = "0.6"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 cros_tracing = { path = "../cros_tracing" }
@@ -28,7 +28,8 @@ winapi = "*"
 win_util = { path = "../win_util" }
 sync = { path = "../common/sync" }
 euclid = "*"
-vm_control = { path = "../vm_control" }
+vm_control = { path = "../vm_control", features = ["gpu"] }
+once_cell = "*"
 
 [build-dependencies]
 cc = "1.0.25"

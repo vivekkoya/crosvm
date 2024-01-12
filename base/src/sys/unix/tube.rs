@@ -2,8 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::io::IoSlice;
-use std::io::IoSliceMut;
 use std::os::unix::prelude::AsRawFd;
 use std::os::unix::prelude::RawFd;
 use std::time::Duration;
@@ -13,11 +11,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::descriptor::AsRawDescriptor;
-use crate::descriptor::FromRawDescriptor;
-use crate::descriptor::SafeDescriptor;
+use crate::descriptor_reflection::deserialize_with_descriptors;
+use crate::descriptor_reflection::SerializeDescriptors;
 use crate::handle_eintr;
-use crate::platform::deserialize_with_descriptors;
-use crate::platform::SerializeDescriptors;
 use crate::tube::Error;
 use crate::tube::RecvTube;
 use crate::tube::Result;
@@ -36,7 +32,7 @@ const TUBE_MAX_FDS: usize = 32;
 /// Bidirectional tube that support both send and recv.
 #[derive(Serialize, Deserialize)]
 pub struct Tube {
-    socket: StreamChannel,
+    socket: ScmSocket<StreamChannel>,
 }
 
 impl Tube {
@@ -55,17 +51,21 @@ impl Tube {
     /// underlying socket type), otherwise, this method returns an error.
     pub fn new(socket: StreamChannel) -> Result<Tube> {
         match socket.get_framing_mode() {
-            FramingMode::Message => Ok(Tube { socket }),
+            FramingMode::Message => Ok(Tube {
+                socket: socket.try_into().map_err(Error::DupDescriptor)?,
+            }),
             FramingMode::Byte => Err(Error::InvalidFramingMode),
         }
     }
 
     /// Create a new `Tube` from a UnixSeqpacket. The StreamChannel is implicitly constructed to
     /// have the right FramingMode by being constructed from a UnixSeqpacket.
-    pub fn new_from_unix_seqpacket(sock: UnixSeqpacket) -> Tube {
-        Tube {
-            socket: StreamChannel::from_unix_seqpacket(sock),
-        }
+    pub fn new_from_unix_seqpacket(sock: UnixSeqpacket) -> Result<Tube> {
+        Ok(Tube {
+            socket: StreamChannel::from_unix_seqpacket(sock)
+                .try_into()
+                .map_err(Error::DupDescriptor)?,
+        })
     }
 
     /// DO NOT USE this method directly as it will become private soon (b/221484449). Use a
@@ -73,6 +73,7 @@ impl Tube {
     #[deprecated]
     pub fn try_clone(&self) -> Result<Self> {
         self.socket
+            .inner()
             .try_clone()
             .map(Tube::new)
             .map_err(Error::Clone)?
@@ -87,56 +88,43 @@ impl Tube {
             return Err(Error::SendTooManyFds);
         }
 
-        handle_eintr!(self
-            .socket
-            .send_with_fds(&[IoSlice::new(&msg_json)], &msg_descriptors))
-        .map_err(Error::Send)?;
+        handle_eintr!(self.socket.send_with_fds(&msg_json, &msg_descriptors))
+            .map_err(Error::Send)?;
         Ok(())
     }
 
     pub fn recv<T: DeserializeOwned>(&self) -> Result<T> {
-        let msg_size = handle_eintr!(self.socket.peek_size()).map_err(Error::Recv)?;
+        let msg_size = handle_eintr!(self.socket.inner().peek_size()).map_err(Error::Recv)?;
         // This buffer is the right size, as the size received in peek_size() represents the size
         // of only the message itself and not the file descriptors. The descriptors are stored
         // separately in msghdr::msg_control.
         let mut msg_json = vec![0u8; msg_size];
 
-        let mut msg_descriptors_full = [0; TUBE_MAX_FDS];
-
-        let (msg_json_size, descriptor_size) = handle_eintr!(self
-            .socket
-            .recv_with_fds(IoSliceMut::new(&mut msg_json), &mut msg_descriptors_full))
-        .map_err(Error::Recv)?;
+        let (msg_json_size, msg_descriptors) =
+            handle_eintr!(self.socket.recv_with_fds(&mut msg_json, TUBE_MAX_FDS))
+                .map_err(Error::Recv)?;
 
         if msg_json_size == 0 {
             return Err(Error::Disconnected);
         }
 
-        let mut msg_descriptors_safe = msg_descriptors_full[..descriptor_size]
-            .iter()
-            .map(|v| {
-                Some(unsafe {
-                    // Safe because the socket returns new fds that are owned locally by this scope.
-                    SafeDescriptor::from_raw_descriptor(*v)
-                })
-            })
-            .collect();
-
         deserialize_with_descriptors(
             || serde_json::from_slice(&msg_json[0..msg_json_size]),
-            &mut msg_descriptors_safe,
+            msg_descriptors,
         )
         .map_err(Error::Json)
     }
 
     pub fn set_send_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.socket
+            .inner()
             .set_write_timeout(timeout)
             .map_err(Error::SetSendTimeout)
     }
 
     pub fn set_recv_timeout(&self, timeout: Option<Duration>) -> Result<()> {
         self.socket
+            .inner()
             .set_read_timeout(timeout)
             .map_err(Error::SetRecvTimeout)
     }
@@ -146,22 +134,19 @@ impl Tube {
         let bytes = msg.write_to_bytes().map_err(Error::Proto)?;
         let no_fds: [RawFd; 0] = [];
 
-        handle_eintr!(self.socket.send_with_fds(&[IoSlice::new(&bytes)], &no_fds))
-            .map_err(Error::Send)?;
+        handle_eintr!(self.socket.send_with_fds(&bytes, &no_fds)).map_err(Error::Send)?;
 
         Ok(())
     }
 
     #[cfg(feature = "proto_tube")]
     fn recv_proto<M: protobuf::Message>(&self) -> Result<M> {
-        let msg_size = handle_eintr!(self.socket.peek_size()).map_err(Error::Recv)?;
+        let msg_size = handle_eintr!(self.socket.inner().peek_size()).map_err(Error::Recv)?;
         let mut msg_bytes = vec![0u8; msg_size];
-        let mut msg_descriptors_full = [0; TUBE_MAX_FDS];
 
-        let (msg_bytes_size, _) = handle_eintr!(self
-            .socket
-            .recv_with_fds(IoSliceMut::new(&mut msg_bytes), &mut msg_descriptors_full))
-        .map_err(Error::Recv)?;
+        let (msg_bytes_size, _) =
+            handle_eintr!(self.socket.recv_with_fds(&mut msg_bytes, TUBE_MAX_FDS))
+                .map_err(Error::Recv)?;
 
         if msg_bytes_size == 0 {
             return Err(Error::Disconnected);
@@ -179,7 +164,7 @@ impl AsRawDescriptor for Tube {
 
 impl AsRawFd for Tube {
     fn as_raw_fd(&self) -> RawFd {
-        self.socket.as_raw_fd()
+        self.socket.inner().as_raw_fd()
     }
 }
 
@@ -221,8 +206,8 @@ impl ProtoTube {
         self.0.recv_proto()
     }
 
-    pub fn new_from_unix_seqpacket(sock: UnixSeqpacket) -> ProtoTube {
-        ProtoTube(Tube::new_from_unix_seqpacket(sock))
+    pub fn new_from_unix_seqpacket(sock: UnixSeqpacket) -> Result<ProtoTube> {
+        Ok(ProtoTube(Tube::new_from_unix_seqpacket(sock)?))
     }
 }
 

@@ -4,6 +4,7 @@
 
 use std::env;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
@@ -17,6 +18,11 @@ use base::syslog;
 use base::test_utils::check_can_sudo;
 use crc32fast::hash;
 use delegate::wire_format::DelegateMessage;
+use delegate::wire_format::ExitStatus;
+use delegate::wire_format::GuestToHostMessage;
+use delegate::wire_format::HostToGuestMessage;
+use delegate::wire_format::ProgramExit;
+use log::info;
 use log::Level;
 use prebuilts::download_file;
 use url::Url;
@@ -24,10 +30,6 @@ use url::Url;
 use crate::sys::SerialArgs;
 use crate::sys::TestVmSys;
 use crate::utils::run_with_timeout;
-use delegate::wire_format::ExitStatus;
-use delegate::wire_format::GuestToHostMessage;
-use delegate::wire_format::HostToGuestMessage;
-use delegate::wire_format::ProgramExit;
 
 const PREBUILT_URL: &str = "https://storage.googleapis.com/crosvm/integration_tests";
 
@@ -192,7 +194,7 @@ impl Default for Config {
 impl Config {
     /// Creates a new `run` command with `extra_args`.
     pub fn new() -> Self {
-        Default::default()
+        Self::from_env()
     }
 
     /// Uses extra arguments for `crosvm run`.
@@ -216,17 +218,27 @@ impl Config {
 
     pub fn from_env() -> Self {
         let mut cfg: Config = Default::default();
-        env::var("CROSVM_CARGO_TEST_E2E_WRAPPER_CMD").map_or((), |x| cfg.wrapper_cmd = Some(x));
-        env::var("CROSVM_CARGO_TEST_LOG_FILE").map_or((), |x| cfg.log_file = Some(x));
-        env::var("CROSVM_CARGO_TEST_LOG_LEVEL_DEBUG").map_or((), |_| cfg.log_level = Level::Debug);
-        env::var("CROSVM_CARGO_TEST_KERNEL_IMAGE")
-            .map_or((), |x| cfg.kernel_url = Url::from_file_path(x).unwrap());
-        env::var("CROSVM_CARGO_TEST_INITRD_IMAGE").map_or((), |x| {
-            cfg.initrd_url = Some(Url::from_file_path(x).unwrap())
-        });
-        env::var("CROSVM_CARGO_TEST_ROOTFS_IMAGE").map_or((), |x| {
-            cfg.rootfs_url = Some(Url::from_file_path(x).unwrap())
-        });
+        if let Ok(wrapper_cmd) = env::var("CROSVM_CARGO_TEST_E2E_WRAPPER_CMD") {
+            cfg.wrapper_cmd = Some(wrapper_cmd);
+        }
+        if let Ok(log_file) = env::var("CROSVM_CARGO_TEST_LOG_FILE") {
+            cfg.log_file = Some(log_file);
+        }
+        if env::var("CROSVM_CARGO_TEST_LOG_LEVEL_DEBUG").is_ok() {
+            cfg.log_level = Level::Debug;
+        }
+        if let Ok(kernel_url) = env::var("CROSVM_CARGO_TEST_KERNEL_IMAGE") {
+            info!("Using overrided kernel from env CROSVM_CARGO_TEST_KERNEL_IMAGE={kernel_url}");
+            cfg.kernel_url = Url::from_file_path(kernel_url).unwrap();
+        }
+        if let Ok(initrd_url) = env::var("CROSVM_CARGO_TEST_INITRD_IMAGE") {
+            info!("Using overrided kernel from env CROSVM_CARGO_TEST_INITRD_IMAGE={initrd_url}");
+            cfg.initrd_url = Some(Url::from_file_path(initrd_url).unwrap());
+        }
+        if let Ok(rootfs_url) = env::var("CROSVM_CARGO_TEST_ROOTFS_IMAGE") {
+            info!("Using overrided kernel from env CROSVM_CARGO_TEST_ROOTFS_IMAGE={rootfs_url}");
+            cfg.rootfs_url = Some(Url::from_file_path(rootfs_url).unwrap());
+        }
         cfg
     }
 
@@ -257,6 +269,16 @@ impl Config {
 
     pub fn with_stdout_hardware(mut self, hw_type: &str) -> Self {
         self.console_hardware = hw_type.to_owned();
+        self
+    }
+
+    pub fn with_vhost_user(mut self, device_type: &str, socket_path: &Path) -> Self {
+        self.extra_args.push("--vhost-user".to_string());
+        self.extra_args.push(format!(
+            "{},socket={}",
+            device_type,
+            socket_path.to_str().unwrap()
+        ));
         self
     }
 }

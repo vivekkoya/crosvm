@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Context;
+use base::debug;
 use base::error;
+use base::SharedMemory;
 use remain::sorted;
 use serde::Deserialize;
 use serde::Serialize;
@@ -33,7 +35,7 @@ use crate::DeviceId;
 use crate::PciAddress;
 use crate::PciDevice;
 use crate::Suspendable;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use crate::VfioPlatformDevice;
 use crate::VirtioMmioDevice;
 
@@ -113,6 +115,22 @@ pub trait BusDevice: Send + Suspendable {
     /// * `reg_idx` - The index of the config register to read.
     fn config_register_read(&self, reg_idx: usize) -> u32 {
         0
+    }
+    /// Provides a memory region to back MMIO access to the configuration
+    /// space. If the device can keep the memory region up to date, then it
+    /// should return true, after which no more calls to config_register_read
+    /// will be made. Otherwise the device should return false.
+    ///
+    /// The device must set the header type register (0x0E) before returning
+    /// from this function, and must make no further modifications to it
+    /// after returning. This is to allow the caller to manage the multi-
+    /// function device bit without worrying about race conditions.
+    ///
+    /// * `shmem` - The shared memory to use for the configuration space.
+    /// * `base` - The base address of the memory region in shmem.
+    /// * `len` - The length of the memory region.
+    fn init_pci_config_mapping(&mut self, shmem: &SharedMemory, base: usize, len: usize) -> bool {
+        false
     }
     /// Sets a register in the virtual config space. Only used by PCI.
     /// * `reg_idx` - The index of the config register to modify.
@@ -204,6 +222,8 @@ pub trait HotPlugBus {
     /// - 'None': hotplug bus isn't match with host pci device
     /// - 'Some(bus_num)': hotplug bus is match and put the device at bus_num
     fn is_match(&self, host_addr: PciAddress) -> Option<u8>;
+    /// Gets the upstream PCI Address of the hotplug bus
+    fn get_address(&self) -> Option<PciAddress>;
     /// Gets the secondary bus number of this bus
     fn get_secondary_bus_number(&self) -> Option<u8>;
     /// Add hotplug device into this bus
@@ -231,15 +251,15 @@ pub trait BusDeviceObj {
     fn into_pci_device(self: Box<Self>) -> Option<Box<dyn PciDevice>> {
         None
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn as_platform_device(&self) -> Option<&VfioPlatformDevice> {
         None
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn as_platform_device_mut(&mut self) -> Option<&mut VfioPlatformDevice> {
         None
     }
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn into_platform_device(self: Box<Self>) -> Option<Box<VfioPlatformDevice>> {
         None
     }
@@ -309,7 +329,7 @@ impl Ord for BusRange {
 
 impl PartialOrd for BusRange {
     fn partial_cmp(&self, other: &BusRange) -> Option<Ordering> {
-        self.base.partial_cmp(&other.base)
+        Some(self.cmp(other))
     }
 }
 
@@ -342,17 +362,24 @@ pub struct Bus {
     access_id: usize,
     #[cfg(feature = "stats")]
     pub stats: Arc<Mutex<BusStatistics>>,
+    bus_type: BusType,
 }
 
 impl Bus {
     /// Constructs an a bus with an empty address space.
-    pub fn new() -> Bus {
+    pub fn new(bus_type: BusType) -> Bus {
         Bus {
             devices: Arc::new(Mutex::new(BTreeMap::new())),
             access_id: 0,
             #[cfg(feature = "stats")]
             stats: Arc::new(Mutex::new(BusStatistics::new())),
+            bus_type,
         }
+    }
+
+    /// Gets the bus type
+    pub fn get_bus_type(&self) -> BusType {
+        self.bus_type
     }
 
     /// Sets the id that will be used for BusAccessInfo.
@@ -401,10 +428,12 @@ impl Bus {
             match device_entry {
                 BusDeviceEntry::OuterSync(dev) => {
                     let mut dev = (*dev).lock();
+                    debug!("Sleep on device: {}", dev.debug_label());
                     dev.sleep()
                         .with_context(|| format!("failed to sleep {}", dev.debug_label()))?;
                 }
                 BusDeviceEntry::InnerSync(dev) => {
+                    debug!("Sleep on device: {}", dev.debug_label());
                     dev.sleep_sync()
                         .with_context(|| format!("failed to sleep {}", dev.debug_label()))?;
                 }
@@ -418,10 +447,12 @@ impl Bus {
             match device_entry {
                 BusDeviceEntry::OuterSync(dev) => {
                     let mut dev = dev.lock();
+                    debug!("Wake on device: {}", dev.debug_label());
                     dev.wake()
                         .with_context(|| format!("failed to wake {}", dev.debug_label()))?;
                 }
                 BusDeviceEntry::InnerSync(dev) => {
+                    debug!("Wake on device: {}", dev.debug_label());
                     dev.wake_sync()
                         .with_context(|| format!("failed to wake {}", dev.debug_label()))?;
                 }
@@ -437,18 +468,22 @@ impl Bus {
         for device_entry in self.unique_devices() {
             match device_entry {
                 BusDeviceEntry::OuterSync(dev) => {
-                    let dev = dev.lock();
+                    let mut dev = dev.lock();
+                    debug!("Snapshot on device: {}", dev.debug_label());
                     add_snapshot(
                         u32::from(dev.device_id()),
                         dev.snapshot()
                             .with_context(|| format!("failed to snapshot {}", dev.debug_label()))?,
                     )
                 }
-                BusDeviceEntry::InnerSync(dev) => add_snapshot(
-                    u32::from(dev.device_id()),
-                    dev.snapshot_sync()
-                        .with_context(|| format!("failed to snapshot {}", dev.debug_label()))?,
-                ),
+                BusDeviceEntry::InnerSync(dev) => {
+                    debug!("Snapshot on device: {}", dev.debug_label());
+                    add_snapshot(
+                        u32::from(dev.device_id()),
+                        dev.snapshot_sync()
+                            .with_context(|| format!("failed to snapshot {}", dev.debug_label()))?,
+                    )
+                }
             }
         }
         Ok(())
@@ -467,19 +502,21 @@ impl Bus {
             match device_entry {
                 BusDeviceEntry::OuterSync(dev) => {
                     let mut dev = dev.lock();
+                    debug!("Restore on device: {}", dev.debug_label());
                     let snapshot = pop_snapshot(dev.device_id()).ok_or_else(|| {
-                        anyhow!("missing snapshot for device {:?}", dev.debug_label())
+                        anyhow!("missing snapshot for device {}", dev.debug_label())
                     })?;
                     dev.restore(snapshot).with_context(|| {
-                        format!("restore failed for device {:?}", dev.debug_label())
+                        format!("restore failed for device {}", dev.debug_label())
                     })?;
                 }
                 BusDeviceEntry::InnerSync(dev) => {
+                    debug!("Restore on device: {}", dev.debug_label());
                     let snapshot = pop_snapshot(dev.device_id()).ok_or_else(|| {
-                        anyhow!("missing snapshot for device {:?}", dev.debug_label())
+                        anyhow!("missing snapshot for device {}", dev.debug_label())
                     })?;
                     dev.restore_sync(snapshot).with_context(|| {
-                        format!("restore failed for device {:?}", dev.debug_label())
+                        format!("restore failed for device {}", dev.debug_label())
                     })?;
                 }
             }
@@ -702,7 +739,7 @@ impl Bus {
 
 impl Default for Bus {
     fn default() -> Self {
-        Self::new()
+        Self::new(BusType::Io)
     }
 }
 
@@ -728,7 +765,7 @@ mod tests {
     }
 
     impl Suspendable for DummyDevice {
-        fn snapshot(&self) -> AnyhowResult<serde_json::Value> {
+        fn snapshot(&mut self) -> AnyhowResult<serde_json::Value> {
             serde_json::to_value(self).context("error serializing")
         }
 
@@ -784,7 +821,7 @@ mod tests {
     }
 
     impl Suspendable for ConstantDevice {
-        fn snapshot(&self) -> AnyhowResult<serde_json::Value> {
+        fn snapshot(&mut self) -> AnyhowResult<serde_json::Value> {
             serde_json::to_value(self).context("error serializing")
         }
 
@@ -808,7 +845,7 @@ mod tests {
 
     #[test]
     fn bus_insert() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::Io);
         let dummy = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(dummy.clone(), 0x10, 0).is_err());
         assert!(bus.insert(dummy.clone(), 0x10, 0x10).is_ok());
@@ -825,7 +862,7 @@ mod tests {
 
     #[test]
     fn bus_insert_full_addr() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::Io);
         let dummy = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(dummy.clone(), 0x10, 0).is_err());
         assert!(bus.insert(dummy.clone(), 0x10, 0x10).is_ok());
@@ -842,7 +879,7 @@ mod tests {
 
     #[test]
     fn bus_read_write() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::Io);
         let dummy = Arc::new(Mutex::new(DummyDevice));
         assert!(bus.insert(dummy, 0x10, 0x10).is_ok());
         assert!(bus.read(0x10, &mut [0, 0, 0, 0]));
@@ -859,7 +896,7 @@ mod tests {
 
     #[test]
     fn bus_read_write_values() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::Io);
         let dummy = Arc::new(Mutex::new(ConstantDevice {
             uses_full_addr: false,
         }));
@@ -876,7 +913,7 @@ mod tests {
 
     #[test]
     fn bus_read_write_full_addr_values() {
-        let bus = Bus::new();
+        let bus = Bus::new(BusType::Io);
         let dummy = Arc::new(Mutex::new(ConstantDevice {
             uses_full_addr: true,
         }));

@@ -570,6 +570,7 @@ impl<D: DecoderBackend> Decoder<D> {
                     return Err(VideoError::InvalidArgument);
                 }
                 GuestResource::from_virtio_object_entry(
+                    // SAFETY:
                     // Safe because we confirmed the correct type for the resource.
                     // unwrap() is also safe here because we just tested above that `entries` had
                     // exactly one element.
@@ -580,6 +581,7 @@ impl<D: DecoderBackend> Decoder<D> {
                 .map_err(|_| VideoError::InvalidArgument)?
             }
             ResourceType::GuestPages => GuestResource::from_virtio_guest_mem_entry(
+                // SAFETY:
                 // Safe because we confirmed the correct type for the resource.
                 unsafe {
                     std::slice::from_raw_parts(
@@ -1227,9 +1229,9 @@ impl<D: DecoderBackend> Device for Decoder<D> {
 
         match ctx.pending_responses.front() {
             Some(PendingResponse::PollingBufferBarrier(desc)) => {
-                wait_ctx
-                    .delete(&Descriptor(desc.as_raw_descriptor()))
-                    .unwrap();
+                // `delete` can return an error if the descriptor has been closed by e.g. the GPU
+                // driver. We can safely ignore these.
+                let _ = wait_ctx.delete(&Descriptor(desc.as_raw_descriptor()));
                 ctx.pending_responses.pop_front();
             }
             _ => {

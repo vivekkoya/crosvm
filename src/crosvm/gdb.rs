@@ -244,7 +244,7 @@ impl SingleThreadBase for GdbStub {
         &mut self,
         start_addr: <Self::Arch as Arch>::Usize,
         data: &mut [u8],
-    ) -> TargetResult<(), Self> {
+    ) -> TargetResult<usize, Self> {
         match self.vcpu_request(VcpuControl::Debug(VcpuDebug::ReadMem(
             GuestAddress(start_addr),
             data.len(),
@@ -253,7 +253,7 @@ impl SingleThreadBase for GdbStub {
                 for (dst, v) in data.iter_mut().zip(r.iter()) {
                     *dst = *v;
                 }
-                Ok(())
+                Ok(data.len())
             }
             Ok(s) => {
                 error!("Unexpected vCPU response for ReadMem: {:?}", s);
@@ -584,7 +584,7 @@ where
         }
         VcpuDebug::ReadMem(vaddr, len) => VcpuDebugStatus::MemoryRegion(
             <CrosvmArch as arch::GdbOps<V>>::read_memory(vcpu as &V, guest_mem, vaddr, len)
-                .unwrap_or(Vec::new()),
+                .unwrap_or_default(),
         ),
         VcpuDebug::WriteMem(vaddr, buf) => {
             <CrosvmArch as arch::GdbOps<V>>::write_memory(vcpu as &V, guest_mem, vaddr, &buf)

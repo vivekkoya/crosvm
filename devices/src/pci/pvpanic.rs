@@ -18,6 +18,7 @@ use anyhow::Context;
 use base::error;
 use base::RawDescriptor;
 use base::SendTube;
+use base::SharedMemory;
 use base::VmEventType;
 use resources::Alloc;
 use resources::AllocOptions;
@@ -181,7 +182,19 @@ impl PciDevice for PvPanicPciDevice {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
-        self.config_regs.write_reg(reg_idx, offset, data)
+        self.config_regs.write_reg(reg_idx, offset, data);
+    }
+
+    fn setup_pci_config_mapping(
+        &mut self,
+        shmem: &SharedMemory,
+        base: usize,
+        len: usize,
+    ) -> Result<bool> {
+        self.config_regs
+            .setup_mapping(shmem, base, len)
+            .map(|_| true)
+            .map_err(PciDeviceError::MmioSetup)
     }
 
     fn read_bar(&mut self, bar_index: PciBarIndex, offset: u64, data: &mut [u8]) {
@@ -207,7 +220,7 @@ impl PciDevice for PvPanicPciDevice {
 }
 
 impl Suspendable for PvPanicPciDevice {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         self.config_regs
             .snapshot()
             .context("failed to serialize PvPanicPciDevice")

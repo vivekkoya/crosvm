@@ -10,20 +10,18 @@ use std::num::Wrapping;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::str;
-use std::sync::Mutex as StdMutex;
 
 use anyhow::Context;
 use argh::FromArgs;
 use base::AsRawDescriptor;
 use base::Event;
-use base::FromRawDescriptor;
-use base::IntoRawDescriptor;
+use base::SafeDescriptor;
 use cros_async::Executor;
 use data_model::Le64;
 use vhost::Vhost;
 use vhost::Vsock;
 use vm_memory::GuestMemory;
-use vmm_vhost::connection::Endpoint;
+use vmm_vhost::connection::Connection;
 use vmm_vhost::message::SlaveReq;
 use vmm_vhost::message::VhostSharedMemoryRegion;
 use vmm_vhost::message::VhostUserConfigFlags;
@@ -35,14 +33,14 @@ use vmm_vhost::message::VhostUserVringAddrFlags;
 use vmm_vhost::message::VhostUserVringState;
 use vmm_vhost::Error;
 use vmm_vhost::Result;
-use vmm_vhost::VhostUserSlaveReqHandlerMut;
+use vmm_vhost::VhostUserSlaveReqHandler;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 use zerocopy::AsBytes;
 
 use crate::virtio::device_constants::vsock::NUM_QUEUES;
 use crate::virtio::vhost::user::device::handler::vmm_va_to_gpa;
 use crate::virtio::vhost::user::device::handler::MappingInfo;
-use crate::virtio::vhost::user::device::handler::VhostUserPlatformOps;
+use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
 use crate::virtio::vhost::user::VhostUserDevice;
 use crate::virtio::vhost::user::VhostUserListener;
 use crate::virtio::vhost::user::VhostUserListenerTrait;
@@ -55,7 +53,6 @@ struct VsockBackend {
     queues: [QueueConfig; NUM_QUEUES],
     vmm_maps: Option<Vec<MappingInfo>>,
     mem: Option<GuestMemory>,
-    ops: Box<dyn VhostUserPlatformOps>,
 
     handle: Vsock,
     cid: u64,
@@ -101,7 +98,6 @@ impl VhostUserDevice for VhostUserVsockDevice {
 
     fn into_req_handler(
         self: Box<Self>,
-        ops: Box<dyn VhostUserPlatformOps>,
         _ex: &Executor,
     ) -> anyhow::Result<Box<dyn vmm_vhost::VhostUserSlaveReqHandler>> {
         let backend = VsockBackend {
@@ -112,13 +108,12 @@ impl VhostUserDevice for VhostUserVsockDevice {
             ],
             vmm_maps: None,
             mem: None,
-            ops,
             handle: self.handle,
             cid: self.cid,
             protocol_features: VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::CONFIG,
         };
 
-        Ok(Box::new(StdMutex::new(backend)))
+        Ok(Box::new(backend))
     }
 }
 
@@ -130,7 +125,7 @@ fn convert_vhost_error(err: vhost::Error) -> Error {
     }
 }
 
-impl VhostUserSlaveReqHandlerMut for VsockBackend {
+impl VhostUserSlaveReqHandler for VsockBackend {
     fn set_owner(&mut self) -> Result<()> {
         self.handle.set_owner().map_err(convert_vhost_error)
     }
@@ -173,7 +168,7 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
         contexts: &[VhostUserMemoryRegion],
         files: Vec<File>,
     ) -> Result<()> {
-        let (guest_mem, vmm_maps) = self.ops.set_mem_table(contexts, files)?;
+        let (guest_mem, vmm_maps) = VhostUserRegularOps::set_mem_table(contexts, files)?;
 
         self.handle
             .set_mem_table(&guest_mem)
@@ -299,7 +294,7 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
             return Err(Error::InvalidParam);
         }
 
-        let event = self.ops.set_vring_kick(index, fd)?;
+        let event = VhostUserRegularOps::set_vring_kick(index, fd)?;
         let index = usize::from(index);
         if index != EVENT_QUEUE {
             self.handle
@@ -315,7 +310,15 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
             return Err(Error::InvalidParam);
         }
 
-        let doorbell = self.ops.set_vring_call(index, fd)?;
+        let doorbell = VhostUserRegularOps::set_vring_call(
+            index,
+            fd,
+            Box::new(|| {
+                // `doorbell.signal_config_changed()` is never called, so this shouldn't be
+                // reachable.
+                unreachable!()
+            }),
+        )?;
         let index = usize::from(index);
         let event = doorbell.get_interrupt_evt();
         if index != EVENT_QUEUE {
@@ -335,8 +338,7 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
         let index = usize::from(index);
         let file = fd.ok_or(Error::InvalidParam)?;
 
-        // Safe because the descriptor is uniquely owned by `file`.
-        let event = unsafe { Event::from_raw_descriptor(file.into_raw_descriptor()) };
+        let event = Event::from(SafeDescriptor::from(file));
 
         if index == EVENT_QUEUE {
             return Ok(());
@@ -398,7 +400,7 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
         Err(Error::InvalidOperation)
     }
 
-    fn set_slave_req_fd(&mut self, _vu_req: Box<dyn Endpoint<SlaveReq>>) {
+    fn set_slave_req_fd(&mut self, _vu_req: Connection<SlaveReq>) {
         // We didn't set VhostUserProtocolFeatures::SLAVE_REQ
         unreachable!("unexpected set_slave_req_fd");
     }
@@ -445,7 +447,7 @@ impl VhostUserSlaveReqHandlerMut for VsockBackend {
         Ok(Vec::new())
     }
 
-    fn restore(&mut self, _data_bytes: &[u8], _queue_evts: Option<Vec<File>>) -> Result<()> {
+    fn restore(&mut self, _data_bytes: &[u8], _queue_evts: Vec<File>) -> Result<()> {
         base::warn!("restore not implemented for vsock.");
         Ok(())
     }

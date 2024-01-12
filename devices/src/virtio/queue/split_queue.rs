@@ -19,6 +19,7 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::virtio::DescriptorChain;
 use crate::virtio::Interrupt;
@@ -75,7 +76,7 @@ pub struct SplitQueueSnapshot {
 }
 
 #[repr(C)]
-#[derive(AsBytes, FromBytes)]
+#[derive(AsBytes, FromZeroes, FromBytes)]
 struct virtq_used_elem {
     id: Le32,
     len: Le32,
@@ -286,8 +287,9 @@ impl SplitQueue {
     }
 
     /// Remove the first available descriptor chain from the queue.
-    /// This function should only be called immediately following `peek`.
-    pub fn pop_peeked(&mut self) {
+    /// This function should only be called immediately following `peek` and must be passed a
+    /// reference to the same `DescriptorChain` returned by the most recent `peek`.
+    pub(super) fn pop_peeked(&mut self, _descriptor_chain: &DescriptorChain) {
         self.next_avail += Wrapping(1);
         if self.features & ((1u64) << VIRTIO_RING_F_EVENT_IDX) != 0 {
             self.set_avail_event(self.next_avail);
@@ -524,7 +526,7 @@ mod tests {
     const BUFFER_OFFSET: u64 = 0x8000;
     const BUFFER_LEN: u32 = 0x400;
 
-    #[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+    #[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
     #[repr(C)]
     struct Avail {
         flags: Le16,
@@ -544,7 +546,7 @@ mod tests {
         }
     }
 
-    #[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+    #[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
     #[repr(C)]
     struct UsedElem {
         id: Le32,
@@ -560,7 +562,7 @@ mod tests {
         }
     }
 
-    #[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+    #[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
     #[repr(C, packed)]
     struct Used {
         flags: Le16,
@@ -619,7 +621,13 @@ mod tests {
         let mem = GuestMemory::new(&[(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
         let mut queue = setup_vq(&mut queue, &mem);
 
-        let interrupt = Interrupt::new(IrqLevelEvent::new().unwrap(), None, 10);
+        let interrupt = Interrupt::new(
+            IrqLevelEvent::new().unwrap(),
+            None,
+            10,
+            #[cfg(target_arch = "x86_64")]
+            None,
+        );
 
         // Offset of used_event within Avail structure
         let used_event_offset = offset_of!(Avail, used_event) as u64;
@@ -689,7 +697,13 @@ mod tests {
         let mem = GuestMemory::new(&[(memory_start_addr, GUEST_MEMORY_SIZE)]).unwrap();
         let mut queue = setup_vq(&mut queue, &mem);
 
-        let interrupt = Interrupt::new(IrqLevelEvent::new().unwrap(), None, 10);
+        let interrupt = Interrupt::new(
+            IrqLevelEvent::new().unwrap(),
+            None,
+            10,
+            #[cfg(target_arch = "x86_64")]
+            None,
+        );
 
         // Offset of used_event within Avail structure
         let used_event_offset = offset_of!(Avail, used_event) as u64;

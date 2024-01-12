@@ -3,10 +3,10 @@
 // found in the LICENSE file.
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        mod unix;
-        pub(super) use self::unix::*;
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        mod linux;
+        pub(super) use self::linux::*;
+        use linux as platform;
     } else if #[cfg(windows)] {
         mod windows;
         pub(super) use self::windows::*;

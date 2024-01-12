@@ -16,6 +16,7 @@ use base::RawDescriptor;
 use broker_ipc::common_child_setup;
 use broker_ipc::CommonChildStartupArgs;
 use cros_async::Executor;
+use cros_async::ExecutorKind;
 use crosvm_cli::sys::windows::exit::Exit;
 use crosvm_cli::sys::windows::exit::ExitContext;
 use crosvm_cli::sys::windows::exit::ExitContextAnyhow;
@@ -27,7 +28,6 @@ use crate::virtio::block::DiskOption;
 use crate::virtio::vhost::user::device::block::BlockBackend;
 use crate::virtio::vhost::user::device::handler::sys::windows::read_from_tube_transporter;
 use crate::virtio::vhost::user::device::handler::sys::windows::run_handler;
-use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
 use crate::virtio::vhost::user::device::VhostUserDevice;
 use crate::virtio::vhost::user::VhostUserBackend;
 use crate::virtio::BlockAsync;
@@ -55,7 +55,7 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     let bootstrap_tube = tubes.get_tube(TubeToken::Bootstrap)?;
 
     let startup_args: CommonChildStartupArgs = bootstrap_tube.recv::<CommonChildStartupArgs>()?;
-    common_child_setup(startup_args)?;
+    let _child_cleanup = common_child_setup(startup_args)?;
 
     let disk_option: DiskOption = bootstrap_tube.recv::<DiskOption>()?;
     let exit_event = bootstrap_tube.recv::<Event>()?;
@@ -67,7 +67,13 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
 
     info!("using {} IO handles.", disk_option.io_concurrency.get());
 
-    let ex = Executor::new().context("failed to create executor")?;
+    let ex = Executor::with_executor_kind(
+        *disk_option
+            .async_executor
+            .as_ref()
+            .unwrap_or(&ExecutorKind::Handle),
+    )
+    .context("failed to create executor")?;
 
     let block = Box::new(BlockAsync::new(
         base_features(ProtectionType::Unprotected),
@@ -89,7 +95,7 @@ pub fn start_device(opts: Options) -> anyhow::Result<()> {
     //     }
 
     // This is basically the event loop.
-    let handler = block.into_req_handler(Box::new(VhostUserRegularOps), &ex)?;
+    let handler = block.into_req_handler(&ex)?;
 
     info!("vhost-user disk device ready, starting run loop...");
     if let Err(e) = ex.run_until(run_handler(handler, vhost_user_tube, exit_event, &ex)) {

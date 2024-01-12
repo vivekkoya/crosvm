@@ -16,6 +16,8 @@ use arch::LinuxArch;
 use arch::SmbiosOptions;
 use base::Event;
 use base::Tube;
+use devices::Bus;
+use devices::BusType;
 use devices::IrqChipX86_64;
 use devices::PciConfigIo;
 use hypervisor::CpuConfigX86_64;
@@ -107,8 +109,8 @@ where
 
     let mut irq_chip = create_irq_chip(vm.try_clone().expect("failed to clone vm"), 1, device_tube);
 
-    let mmio_bus = Arc::new(devices::Bus::new());
-    let io_bus = Arc::new(devices::Bus::new());
+    let mmio_bus = Arc::new(Bus::new(BusType::Mmio));
+    let io_bus = Arc::new(Bus::new(BusType::Io));
     let (exit_evt_wrtube, _) = Tube::directional_pair().unwrap();
 
     let mut control_tubes = vec![TaggedControlTube::VmIrq(irqchip_tube)];
@@ -131,6 +133,8 @@ where
         devices,
         &mut irq_chip,
         mmio_bus.clone(),
+        GuestAddress(0),
+        12,
         io_bus.clone(),
         &mut resources,
         &mut vm,
@@ -215,7 +219,7 @@ where
         &mut resume_notify_devices,
         #[cfg(feature = "swap")]
         &mut None,
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         false,
         Default::default(),
         &pci_irqs,
@@ -230,6 +234,7 @@ where
         kernel_end,
         params,
         None,
+        Vec::new(),
     )
     .expect("failed to setup system_memory");
 

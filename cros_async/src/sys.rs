@@ -3,9 +3,9 @@
 // found in the LICENSE file.
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        pub mod unix;
-        pub use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        pub mod linux;
+        pub use linux as platform;
     } else if #[cfg(windows)] {
         pub mod windows;
         pub use windows as platform;

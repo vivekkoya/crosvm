@@ -4,7 +4,7 @@
 
 //! Testing vsock.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 use std::io::Write;
 use std::path::Path;
@@ -24,6 +24,7 @@ use rand::Rng;
 use tempfile::tempdir;
 use tempfile::NamedTempFile;
 
+const ANY_CID: &str = "4294967295"; // -1U
 const HOST_CID: u64 = 2;
 
 const SERVER_TIMEOUT: Duration = Duration::from_secs(3);
@@ -123,7 +124,7 @@ fn host_to_guest_disable_sandbox_snapshot_restore() {
 fn host_to_guest_connection(vm: &mut TestVm, guest_cid: u32, guest_port: u32) {
     let guest_cmd = vm
         .exec_in_guest_async(&format!(
-            "echo {MESSAGE_TO_HOST} | ncat -l --vsock --send-only {guest_port}"
+            "echo {MESSAGE_TO_HOST} | ncat -l --vsock --send-only {ANY_CID} {guest_port}"
         ))
         .unwrap();
 
@@ -233,7 +234,7 @@ fn guest_to_host_connection(vm: &mut TestVm, host_port: u32) {
     let mut host_ncat = Command::new("ncat")
         .arg("-l")
         .arg("--send-only")
-        .args(["--vsock", &host_port.to_string()])
+        .args(["--vsock", ANY_CID, &host_port.to_string()])
         .stdin(Stdio::piped())
         .log()
         .spawn()
@@ -281,8 +282,8 @@ fn vhost_user_host_to_guest() {
     let _vu_device = VhostUserBackend::new(vu_config).unwrap();
 
     let config = Config::new().extra_args(vec![
-        "--vhost-user-vsock".to_string(),
-        socket.path().to_str().unwrap().to_string(),
+        "--vhost-user".to_string(),
+        format!("vsock,socket={}", socket.path().to_str().unwrap()),
     ]);
 
     let mut vm = TestVm::new(config).unwrap();
@@ -299,8 +300,8 @@ fn vhost_user_host_to_guest_with_devices() {
     let _vu_device = VhostUserBackend::new(vu_config).unwrap();
 
     let config = Config::new().extra_args(vec![
-        "--vhost-user-vsock".to_string(),
-        socket.path().to_str().unwrap().to_string(),
+        "--vhost-user".to_string(),
+        format!("vsock,socket={}", socket.path().to_str().unwrap()),
     ]);
 
     let mut vm = TestVm::new(config).unwrap();
@@ -317,8 +318,8 @@ fn vhost_user_guest_to_host() {
     let _vu_device = VhostUserBackend::new(vu_config).unwrap();
 
     let config = Config::new().extra_args(vec![
-        "--vhost-user-vsock".to_string(),
-        socket.path().to_str().unwrap().to_string(),
+        "--vhost-user".to_string(),
+        format!("vsock,socket={}", socket.path().to_str().unwrap()),
     ]);
 
     let mut vm = TestVm::new(config).unwrap();
@@ -335,8 +336,8 @@ fn vhost_user_guest_to_host_with_devices() {
     let _vu_device = VhostUserBackend::new(vu_config).unwrap();
 
     let config = Config::new().extra_args(vec![
-        "--vhost-user-vsock".to_string(),
-        socket.path().to_str().unwrap().to_string(),
+        "--vhost-user".to_string(),
+        format!("vsock,socket={}", socket.path().to_str().unwrap()),
     ]);
 
     let mut vm = TestVm::new(config).unwrap();

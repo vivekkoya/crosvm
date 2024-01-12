@@ -5,8 +5,8 @@
 //! Legacy console device that uses a polling thread. This is kept because it is still used by
 //! Windows ; outside of this use-case, please use [[asynchronous::AsyncConsole]] instead.
 
-#[cfg(unix)]
 pub mod asynchronous;
+mod multiport;
 mod sys;
 
 use std::collections::BTreeMap;
@@ -41,7 +41,9 @@ use thiserror::Error as ThisError;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
+use crate::serial::sys::InStreamType;
 use crate::virtio::base_features;
 use crate::virtio::copy_config;
 use crate::virtio::DeviceType;
@@ -64,7 +66,7 @@ pub enum ConsoleError {
     RxDescriptorsExhausted,
 }
 
-#[derive(Copy, Clone, Debug, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, AsBytes, FromZeroes, FromBytes)]
 #[repr(C)]
 pub struct virtio_console_config {
     pub cols: Le16,
@@ -108,7 +110,7 @@ fn handle_input(
         let bytes_written = writer.bytes_written() as u32;
 
         if bytes_written > 0 {
-            receive_queue.pop_peeked();
+            let desc = desc.pop();
             receive_queue.add_used(desc, bytes_written);
             receive_queue.trigger_interrupt(interrupt);
         }
@@ -255,20 +257,15 @@ impl Worker {
     }
 }
 
-enum ConsoleInput {
-    FromRead(crate::serial::sys::InStreamType),
-    FromThread(Arc<Mutex<VecDeque<u8>>>),
-}
-
 /// Virtio console device.
 pub struct Console {
     base_features: u64,
-    in_avail_evt: Option<Event>,
+    in_avail_evt: Event,
     worker_thread: Option<WorkerThread<Worker>>,
-    input: Option<ConsoleInput>,
+    input: Option<InStreamType>,
     output: Option<Box<dyn io::Write + Send>>,
     keep_descriptors: Vec<Descriptor>,
-    input_thread: Option<WorkerThread<()>>,
+    input_thread: Option<WorkerThread<InStreamType>>,
     // input_buffer is not continuously updated. It holds the state of the buffer when a snapshot
     // happens, or when a restore is performed. On a fresh startup, it will be empty. On a restore,
     // it will contain whatever data was remaining in the buffer in the snapshot.
@@ -284,13 +281,15 @@ struct ConsoleSnapshot {
 impl Console {
     fn new(
         protection_type: ProtectionType,
-        input: Option<ConsoleInput>,
+        input: Option<InStreamType>,
         output: Option<Box<dyn io::Write + Send>>,
-        keep_rds: Vec<RawDescriptor>,
+        mut keep_rds: Vec<RawDescriptor>,
     ) -> Console {
+        let in_avail_evt = Event::new().expect("failed creating Event");
+        keep_rds.push(in_avail_evt.as_raw_descriptor());
         Console {
             base_features: base_features(protection_type),
-            in_avail_evt: None,
+            in_avail_evt,
             worker_thread: None,
             input,
             output,
@@ -343,13 +342,8 @@ impl VirtioDevice for Console {
         let receive_queue = queues.remove(&0).unwrap();
         let transmit_queue = queues.remove(&1).unwrap();
 
-        if self.in_avail_evt.is_none() {
-            self.in_avail_evt = Some(Event::new().context("failed creating Event")?);
-        }
         let in_avail_evt = self
             .in_avail_evt
-            .as_ref()
-            .unwrap()
             .try_clone()
             .context("failed creating input available Event pair")?;
 
@@ -359,16 +353,15 @@ impl VirtioDevice for Console {
         // descriptor).  Moving the blocking read call to a separate thread and sending data back to
         // the main worker thread with an event for notification bridges this gap.
         let input = match self.input.take() {
-            Some(ConsoleInput::FromRead(read)) => {
+            Some(read) => {
                 let (buffer, thread) = sys::spawn_input_thread(
                     read,
-                    self.in_avail_evt.as_ref().unwrap(),
-                    self.input_buffer.clone(),
+                    &self.in_avail_evt,
+                    std::mem::take(&mut self.input_buffer),
                 );
                 self.input_thread = Some(thread);
                 Some(buffer)
             }
-            Some(ConsoleInput::FromThread(buffer)) => Some(buffer),
             None => None,
         };
         let output = self.output.take().unwrap_or_else(|| Box::new(io::sink()));
@@ -394,9 +387,14 @@ impl VirtioDevice for Console {
     }
 
     fn reset(&mut self) -> bool {
+        self.input = self.input_thread.take().map(|t| t.stop());
         if let Some(worker_thread) = self.worker_thread.take() {
             let worker = worker_thread.stop();
-            self.input = worker.input.map(ConsoleInput::FromThread);
+            // NOTE: Even though we are reseting the device, it still makes sense to preserve the
+            // pending input bytes that the host sent but the guest hasn't accepted yet.
+            self.input_buffer = worker
+                .input
+                .map_or(VecDeque::new(), |arc_mutex| arc_mutex.lock().clone());
             self.output = Some(worker.output);
             return true;
         }
@@ -404,14 +402,13 @@ impl VirtioDevice for Console {
     }
 
     fn virtio_sleep(&mut self) -> anyhow::Result<Option<BTreeMap<usize, Queue>>> {
+        self.input = self.input_thread.take().map(|t| t.stop());
         if let Some(worker_thread) = self.worker_thread.take() {
-            if let Some(input_thread) = self.input_thread.take() {
-                input_thread.stop();
-            }
             let worker = worker_thread.stop();
-            if let Some(in_buf_ref) = worker.input.as_ref() {
-                self.input_buffer = in_buf_ref.lock().clone();
-            }
+            self.input_buffer = worker
+                .input
+                .map_or(VecDeque::new(), |arc_mutex| arc_mutex.lock().clone());
+            self.output = Some(worker.output);
             let receive_queue = match Arc::try_unwrap(worker.receive_queue) {
                 Ok(mutex) => mutex.into_inner(),
                 Err(_) => return Err(anyhow!("failed to retrieve receive queue to sleep device.")),
@@ -448,7 +445,19 @@ impl VirtioDevice for Console {
         }
     }
 
-    fn virtio_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        if let Some(read) = self.input.as_mut() {
+            // If the device was not activated yet, we still read the input.
+            // It's fine to do so since the the data is not lost. It will get queued in the
+            // input_buffer and restored. When the device activates, the data will still be
+            // available, and if there's any new data, that new data will get appended.
+            let input_buffer = Arc::new(Mutex::new(std::mem::take(&mut self.input_buffer)));
+
+            let kill_evt = Event::new().unwrap();
+            let _ = kill_evt.signal();
+            sys::read_input(read, &self.in_avail_evt, input_buffer.clone(), kill_evt);
+            self.input_buffer = std::mem::take(&mut input_buffer.lock());
+        };
         serde_json::to_value(ConsoleSnapshot {
             // Snapshot base_features as a safeguard when restoring the console device. Saving this
             // info allows us to validate that the proper config was used for the console.

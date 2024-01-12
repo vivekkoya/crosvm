@@ -41,8 +41,9 @@ Here is an example of a good commit message:
 ```
 devices: vhost: user: vmm: Add Connection type
 
-This abstracts away the cross-platform differences: cfg(unix) uses a
-Unix domain stream socket to connect to the vhost-user backend, and
+This abstracts away the cross-platform differences:
+cfg(any(target_os = "android", target_os = "linux")) uses a Unix
+domain domain stream socket to connect to the vhost-user backend, and
 cfg(windows) uses a Tube.
 
 BUG=b:249361790
@@ -78,8 +79,8 @@ git checkout -b myfeature --track origin/main
 ```
 
 After making the necessary changes, and testing them via
-[Presubmit Checks](https://crosvm.dev/book/building_crosvm.html#presubmit-checks), you can commit
-and upload them:
+[Presubmit Checks](https://crosvm.dev/book/building_crosvm/linux.html#presubmit-checks), you can
+commit and upload them:
 
 ```bash
 git commit
@@ -118,8 +119,8 @@ Once one of the [crosvm owners] has voted "Code-Review+2" on your change, you ca
 CQ" button, which will trigger the test process.
 
 Gerrit will show any test failures. Refer to
-[Building Crosvm](https://crosvm.dev/book/building_crosvm.html) for information on how to run the
-same tests locally.
+[Building Crosvm](https://crosvm.dev/book/building_crosvm/) for information on how to run the same
+tests locally.
 
 Each individual change in a patch series must build and pass the tests. If you are working on a
 series of related changes, ensure that each incremental commit does not cause test regressions or

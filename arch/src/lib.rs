@@ -5,6 +5,7 @@
 //! Virtual machine architecture support code.
 
 pub mod android;
+pub mod fdt;
 pub mod pstore;
 pub mod serial;
 
@@ -14,9 +15,6 @@ use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fs::File;
 use std::io;
-use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -29,6 +27,8 @@ use base::syslog;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
 use base::Event;
+use base::FileGetLen;
+use base::FileReadWriteAtVolatile;
 use base::SendTube;
 use base::Tube;
 use devices::virtio::VirtioDevice;
@@ -51,18 +51,20 @@ use devices::PciInterruptPin;
 use devices::PciRoot;
 use devices::PciRootCommand;
 use devices::PreferredIrq;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::ProxyDevice;
 use devices::SerialHardware;
 use devices::SerialParameters;
 use devices::VirtioMmioDevice;
+pub use fdt::apply_device_tree_overlays;
+pub use fdt::DtbOverlay;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
 use hypervisor::IoEventAddress;
 use hypervisor::Vm;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use minijail::Minijail;
 use remain::sorted;
 #[cfg(target_arch = "x86_64")]
@@ -78,10 +80,13 @@ pub use serial::get_serial_cmdline;
 pub use serial::set_default_serial_parameters;
 pub use serial::GetSerialCmdlineError;
 pub use serial::SERIAL_ADDR;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use sys::linux::PlatformBusResources;
 use thiserror::Error;
+use uuid::Uuid;
 use vm_control::BatControl;
 use vm_control::BatteryType;
 use vm_control::PmResource;
@@ -144,6 +149,15 @@ impl CpuSet {
 
     pub fn iter(&self) -> std::slice::Iter<'_, usize> {
         self.0.iter()
+    }
+}
+
+impl FromIterator<usize> for CpuSet {
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = usize>,
+    {
+        CpuSet::new(iter)
     }
 }
 
@@ -321,6 +335,10 @@ pub struct VmComponents {
     pub break_linux_pci_config_io: bool,
     pub cpu_capacity: BTreeMap<usize, u32>,
     pub cpu_clusters: Vec<CpuSet>,
+    #[cfg(all(
+        any(target_arch = "arm", target_arch = "aarch64"),
+        any(target_os = "android", target_os = "linux")
+    ))]
     pub cpu_frequencies: BTreeMap<usize, Vec<u32>>,
     pub delay_rt: bool,
     pub dynamic_power_coefficient: BTreeMap<usize, u32>,
@@ -373,7 +391,7 @@ pub struct RunnableLinuxVm<V: VmArch, Vcpu: VcpuArch> {
     pub mmio_bus: Arc<Bus>,
     pub no_smt: bool,
     pub pid_debug_label_map: BTreeMap<u32, String>,
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     pub platform_devices: Vec<Arc<Mutex<dyn BusDevice>>>,
     pub pm: Option<Arc<Mutex<dyn PmResource + Send>>>,
     /// Devices to be notified before the system resumes from the S3 suspended state.
@@ -443,6 +461,7 @@ pub trait LinuxArch {
     /// * `debugcon_jail` - Jail used for debugcon devices created here.
     /// * `pflash_jail` - Jail used for pflash device created here.
     /// * `fw_cfg_jail` - Jail used for fw_cfg device created here.
+    /// * `device_tree_overlays` - Device tree overlay binaries
     fn build_vm<V, Vcpu>(
         components: VmComponents,
         vm_evt_wrtube: &SendTube,
@@ -460,7 +479,10 @@ pub trait LinuxArch {
         #[cfg(target_arch = "x86_64")] pflash_jail: Option<Minijail>,
         #[cfg(target_arch = "x86_64")] fw_cfg_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(unix)] guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] guest_suspended_cvar: Option<
+            Arc<(Mutex<bool>, Condvar)>,
+        >,
+        device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmArch,
@@ -493,7 +515,7 @@ pub trait LinuxArch {
     fn register_pci_device<V: VmArch, Vcpu: VcpuArch>(
         linux: &mut RunnableLinuxVm<V, Vcpu>,
         device: Box<dyn PciDevice>,
-        #[cfg(unix)] minijail: Option<Minijail>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] minijail: Option<Minijail>,
         resources: &mut SystemAllocator,
         hp_control_tube: &mpsc::Sender<PciRootCommand>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
@@ -501,6 +523,12 @@ pub trait LinuxArch {
 
     /// Returns frequency map for each of the host's logical cores.
     fn get_host_cpu_frequencies_khz() -> Result<BTreeMap<usize, Vec<u32>>, Self::Error>;
+
+    /// Returns capacity map of the host's logical cores.
+    fn get_host_cpu_capacity() -> Result<BTreeMap<usize, u32>, Self::Error>;
+
+    /// Returns cluster masks for each of the host's logical cores.
+    fn get_host_cpu_clusters() -> Result<Vec<CpuSet>, Self::Error>;
 }
 
 #[cfg(feature = "gdb")]
@@ -569,14 +597,14 @@ pub enum DeviceRegistrationError {
     #[error("Allocating IRQ number")]
     AllocateIrq,
     /// Could not allocate IRQ resource for the device.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("Allocating IRQ resource: {0}")]
     AllocateIrqResource(devices::vfio::VfioError),
     /// Broken pci topology
     #[error("pci topology is broken")]
     BrokenPciTopology,
     /// Unable to clone a jail for the device.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("failed to clone jail: {0}")]
     CloneJail(minijail::Error),
     /// Appending to kernel command line failed.
@@ -588,6 +616,9 @@ pub enum DeviceRegistrationError {
     // Unable to create a pipe.
     #[error("failed to create pipe: {0}")]
     CreatePipe(base::Error),
+    // Unable to create a root.
+    #[error("failed to create pci root: {0}")]
+    CreateRoot(anyhow::Error),
     // Unable to create serial device from serial parameters
     #[error("failed to create serial device: {0}")]
     CreateSerialDevice(devices::SerialError),
@@ -606,6 +637,9 @@ pub enum DeviceRegistrationError {
     /// No more IRQs are available.
     #[error("no more IRQs are available")]
     IrqsExhausted,
+    /// VFIO device is missing a DT symbol.
+    #[error("cannot match VFIO device to DT node due to a missing symbol")]
+    MissingDeviceTreeSymbol,
     /// Missing a required serial device.
     #[error("missing required serial device {0}")]
     MissingRequiredSerialDevice(u8),
@@ -615,11 +649,11 @@ pub enum DeviceRegistrationError {
     /// Failed to insert device into PCI root.
     #[error("failed to insert device into PCI root: {0}")]
     PciRootAddDevice(PciDeviceError),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     /// Failed to initialize proxy device for jailed device.
     #[error("failed to create proxy device: {0}")]
     ProxyDeviceCreation(devices::ProxyError),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     /// Failed to register battery device.
     #[error("failed to register battery device to VM: {0}")]
     RegisterBattery(devices::BatteryError),
@@ -644,7 +678,7 @@ pub enum DeviceRegistrationError {
 pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
     linux: &mut RunnableLinuxVm<V, Vcpu>,
     mut device: Box<dyn PciDevice>,
-    #[cfg(unix)] jail: Option<Minijail>,
+    #[cfg(any(target_os = "android", target_os = "linux"))] jail: Option<Minijail>,
     resources: &mut SystemAllocator,
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
     #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
@@ -704,7 +738,7 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
         .register_device_capabilities()
         .map_err(DeviceRegistrationError::RegisterDeviceCapabilities)?;
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {
         let proxy = ProxyDevice::new(
             device,
@@ -729,7 +763,7 @@ pub fn configure_pci_device<V: VmArch, Vcpu: VcpuArch>(
         Arc::new(Mutex::new(device))
     };
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     hp_control_tube
         .send(PciRootCommand::Add(pci_address, arced_dev.clone()))
         .map_err(DeviceRegistrationError::RegisterDevice)?;
@@ -768,7 +802,7 @@ pub fn generate_virtio_mmio_bus(
     #[cfg(target_arch = "x86_64")]
     let mut sdts = sdts;
     for dev_value in devices.into_iter() {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let (mut device, jail) = dev_value;
         #[cfg(windows)]
         let (mut device, _) = dev_value;
@@ -805,7 +839,7 @@ pub fn generate_virtio_mmio_bus(
                 .ok_or(DeviceRegistrationError::GenerateAcpi)?;
         }
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {
             let proxy = ProxyDevice::new(
                 device,
@@ -949,6 +983,8 @@ pub fn generate_pci_root(
     mut devices: Vec<(Box<dyn PciDevice>, Option<Minijail>)>,
     irq_chip: &mut dyn IrqChip,
     mmio_bus: Arc<Bus>,
+    mmio_base: GuestAddress,
+    mmio_register_bit_num: usize,
     io_bus: Arc<Bus>,
     resources: &mut SystemAllocator,
     vm: &mut impl Vm,
@@ -987,7 +1023,15 @@ pub fn generate_pci_root(
         &mut devices,
     )?;
 
-    let mut root = PciRoot::new(Arc::downgrade(&mmio_bus), Arc::downgrade(&io_bus), root_bus);
+    let mut root = PciRoot::new(
+        vm,
+        Arc::downgrade(&mmio_bus),
+        mmio_base,
+        mmio_register_bit_num,
+        Arc::downgrade(&io_bus),
+        root_bus,
+    )
+    .map_err(DeviceRegistrationError::CreateRoot)?;
     #[cfg_attr(windows, allow(unused_mut))]
     let mut pid_labels = BTreeMap::new();
 
@@ -1082,13 +1126,13 @@ pub fn generate_pci_root(
             .into_iter()
             .enumerate()
             .partition(|(_, (_, jail))| jail.is_some());
-        sandboxed.into_iter().chain(non_sandboxed.into_iter())
+        sandboxed.into_iter().chain(non_sandboxed)
     };
 
     let mut amls = BTreeMap::new();
     let mut gpe_scope_amls = BTreeMap::new();
     for (dev_idx, dev_value) in devices {
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let (mut device, jail) = dev_value;
         #[cfg(windows)]
         let (mut device, _) = dev_value;
@@ -1121,7 +1165,7 @@ pub fn generate_pci_root(
         }
         let gpe_nr = device.set_gpe(resources);
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {
             let proxy = ProxyDevice::new(
                 device,
@@ -1142,7 +1186,7 @@ pub fn generate_pci_root(
             device.on_sandboxed();
             Arc::new(Mutex::new(device))
         };
-        root.add_device(address, arced_dev.clone())
+        root.add_device(address, arced_dev.clone(), vm)
             .map_err(DeviceRegistrationError::PciRootAddDevice)?;
         for range in &ranges {
             mmio_bus
@@ -1181,12 +1225,14 @@ pub fn generate_pci_root(
 pub enum LoadImageError {
     #[error("Alignment not a power of two: {0}")]
     BadAlignment(u64),
+    #[error("Getting image size failed: {0}")]
+    GetLen(io::Error),
+    #[error("GuestMemory get slice failed: {0}")]
+    GuestMemorySlice(GuestMemoryError),
     #[error("Image size too large: {0}")]
     ImageSizeTooLarge(u64),
     #[error("Reading image into memory failed: {0}")]
-    ReadToMemory(GuestMemoryError),
-    #[error("Seek failed: {0}")]
-    Seek(io::Error),
+    ReadToMemory(io::Error),
 }
 
 /// Load an image from a file into guest memory.
@@ -1206,9 +1252,9 @@ pub fn load_image<F>(
     max_size: u64,
 ) -> Result<usize, LoadImageError>
 where
-    F: Read + Seek + AsRawDescriptor,
+    F: FileReadWriteAtVolatile + FileGetLen,
 {
-    let size = image.seek(SeekFrom::End(0)).map_err(LoadImageError::Seek)?;
+    let size = image.get_len().map_err(LoadImageError::GetLen)?;
 
     if size > usize::max_value() as u64 || size > max_size {
         return Err(LoadImageError::ImageSizeTooLarge(size));
@@ -1217,12 +1263,11 @@ where
     // This is safe due to the bounds check above.
     let size = size as usize;
 
+    let guest_slice = guest_mem
+        .get_slice_at_addr(guest_addr, size)
+        .map_err(LoadImageError::GuestMemorySlice)?;
     image
-        .seek(SeekFrom::Start(0))
-        .map_err(LoadImageError::Seek)?;
-
-    guest_mem
-        .read_to_memory(guest_addr, image, size)
+        .read_exact_at_volatile(guest_slice, 0)
         .map_err(LoadImageError::ReadToMemory)?;
 
     Ok(size)
@@ -1248,22 +1293,18 @@ pub fn load_image_high<F>(
     align: u64,
 ) -> Result<(GuestAddress, usize), LoadImageError>
 where
-    F: Read + Seek + AsRawDescriptor,
+    F: FileReadWriteAtVolatile + FileGetLen,
 {
     if !align.is_power_of_two() {
         return Err(LoadImageError::BadAlignment(align));
     }
 
     let max_size = max_guest_addr.offset_from(min_guest_addr) & !(align - 1);
-    let size = image.seek(SeekFrom::End(0)).map_err(LoadImageError::Seek)?;
+    let size = image.get_len().map_err(LoadImageError::GetLen)?;
 
     if size > usize::max_value() as u64 || size > max_size {
         return Err(LoadImageError::ImageSizeTooLarge(size));
     }
-
-    image
-        .seek(SeekFrom::Start(0))
-        .map_err(LoadImageError::Seek)?;
 
     // Load image at the maximum aligned address allowed.
     // The subtraction cannot underflow because of the size checks above.
@@ -1272,8 +1313,11 @@ where
     // This is safe due to the bounds check above.
     let size = size as usize;
 
-    guest_mem
-        .read_to_memory(guest_addr, image, size)
+    let guest_slice = guest_mem
+        .get_slice_at_addr(guest_addr, size)
+        .map_err(LoadImageError::GuestMemorySlice)?;
+    image
+        .read_exact_at_volatile(guest_slice, 0)
         .map_err(LoadImageError::ReadToMemory)?;
 
     Ok((guest_addr, size))
@@ -1297,6 +1341,9 @@ pub struct SmbiosOptions {
 
     /// System serial number (free-form string).
     pub serial_number: Option<String>,
+
+    /// System UUID.
+    pub uuid: Option<Uuid>,
 
     /// Additional OEM strings to add to SMBIOS table.
     #[serde(default)]

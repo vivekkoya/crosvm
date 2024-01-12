@@ -15,9 +15,11 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use argh::FromArgs;
+use base::debug;
 use base::error;
 use base::info;
 use base::syslog;
+use base::syslog::LogArgs;
 use base::syslog::LogConfig;
 use cmdline::RunCommand;
 use cmdline::UsbAttachCommand;
@@ -135,10 +137,7 @@ impl From<sys::ExitState> for CommandStatus {
     }
 }
 
-fn run_vm<F: 'static>(cmd: RunCommand, log_config: LogConfig<F>) -> Result<CommandStatus>
-where
-    F: Fn(&mut syslog::fmt::Formatter, &log::Record<'_>) -> std::io::Result<()> + Sync + Send,
-{
+fn run_vm(cmd: RunCommand, log_config: LogConfig) -> Result<CommandStatus> {
     let cfg = match TryInto::<Config>::try_into(cmd) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -690,12 +689,16 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
     };
     let extended_status = args.extended_status;
 
-    info!("CLI arguments parsed.");
+    debug!("CLI arguments parsed.");
 
     let mut log_config = LogConfig {
-        filter: &args.log_level,
-        proc_name: args.syslog_tag.unwrap_or("crosvm".to_string()),
-        syslog: !args.no_syslog,
+        log_args: LogArgs {
+            filter: args.log_level,
+            proc_name: args.syslog_tag.unwrap_or("crosvm".to_string()),
+            syslog: !args.no_syslog,
+            ..Default::default()
+        },
+
         ..Default::default()
     };
 
@@ -709,7 +712,7 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
                          `crosvm --syslog-tag=\"{}\" run` instead",
                         syslog_tag
                     );
-                    log_config.proc_name = syslog_tag.clone();
+                    log_config.log_args.proc_name = syslog_tag.clone();
                 }
                 // We handle run_vm separately because it does not simply signal success/error
                 // but also indicates whether the guest requested reset or stop.
@@ -808,12 +811,13 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
             }
         }
         cmdline::Command::Sys(command) => {
+            let log_args = log_config.log_args.clone();
             // On windows, the sys commands handle their own logging setup, so we can't handle it
             // below otherwise logging will double init.
             if cfg!(unix) {
                 syslog::init_with(log_config).context("failed to initialize syslog")?;
             }
-            sys::run_command(command).map(|_| CommandStatus::SuccessOrVmStop)
+            sys::run_command(command, log_args).map(|_| CommandStatus::SuccessOrVmStop)
         }
     };
 
@@ -832,7 +836,7 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
 
 fn main() {
     syslog::early_init();
-    info!("crosvm started.");
+    debug!("crosvm started.");
     let res = crosvm_main(std::env::args());
 
     let exit_code = match &res {

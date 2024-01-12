@@ -22,7 +22,7 @@ use vm_memory::GuestMemory;
 
 use super::ring_buffer::RingBuffer;
 use super::ring_buffer_stop_cb::RingBufferStopCallback;
-use super::xhci_abi::*;
+use super::xhci_abi::TransferDescriptor;
 use crate::utils;
 use crate::utils::EventHandler;
 use crate::utils::EventLoop;
@@ -243,6 +243,12 @@ mod tests {
     use std::sync::mpsc::channel;
     use std::sync::mpsc::Sender;
 
+    use base::pagesize;
+
+    use super::super::xhci_abi::LinkTrb;
+    use super::super::xhci_abi::NormalTrb;
+    use super::super::xhci_abi::Trb;
+    use super::super::xhci_abi::TrbType;
     use super::*;
 
     struct TestHandler {
@@ -266,7 +272,7 @@ mod tests {
 
     fn setup_mem() -> GuestMemory {
         let trb_size = size_of::<Trb>() as u64;
-        let gm = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let gm = GuestMemory::new(&[(GuestAddress(0), pagesize() as u64)]).unwrap();
 
         // Structure of ring buffer:
         //  0x100  --> 0x200  --> 0x300

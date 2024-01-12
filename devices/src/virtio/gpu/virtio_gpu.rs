@@ -19,7 +19,7 @@ use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
 use base::Protection;
 use base::SafeDescriptor;
-use data_model::VolatileSlice;
+use base::VolatileSlice;
 use gpu_display::*;
 use libc::c_void;
 use rutabaga_gfx::ResourceCreate3D;
@@ -71,11 +71,13 @@ use crate::virtio::resource_bridge::ResourceResponse;
 use crate::virtio::SharedMemoryMapper;
 
 pub fn to_rutabaga_descriptor(s: SafeDescriptor) -> RutabagaDescriptor {
+    // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
     unsafe { RutabagaDescriptor::from_raw_descriptor(s.into_raw_descriptor()) }
 }
 
 fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
+    // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
     unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
@@ -357,9 +359,10 @@ impl VirtioGpuScanout {
         let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height);
         transfer.stride = fb.stride();
         let fb_slice = fb.as_volatile_slice();
-        let buf = IoSliceMut::new(unsafe {
-            std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size())
-        });
+        let buf = IoSliceMut::new(
+            // SAFETY: trivially safe
+            unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
+        );
         rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
 
         display.flip(surface_id);
@@ -789,7 +792,7 @@ impl VirtioGpu {
     }
 
     /// If supported, export the fence with the given `fence_id` to a file.
-    pub fn export_fence(&self, fence_id: u32) -> ResourceResponse {
+    pub fn export_fence(&self, fence_id: u64) -> ResourceResponse {
         match self.rutabaga.export_fence(fence_id) {
             Ok(handle) => ResourceResponse::Resource(ResourceInfo::Fence {
                 handle: to_safe_descriptor(handle.os_handle),
@@ -930,7 +933,10 @@ impl VirtioGpu {
         buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
         let buf = buf.map(|vs| {
-            IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(vs.as_mut_ptr(), vs.size()) })
+            IoSliceMut::new(
+                // SAFETY: trivially safe
+                unsafe { std::slice::from_raw_parts_mut(vs.as_mut_ptr(), vs.size()) },
+            )
         });
         self.rutabaga
             .transfer_read(ctx_id, resource_id, transfer, buf)?;

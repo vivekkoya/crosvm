@@ -10,10 +10,10 @@ use libc::O_RDONLY;
 use libc::O_RDWR;
 use libc::O_WRONLY;
 
-use super::errno_result;
-use super::Error;
-use super::Result;
+use crate::errno_result;
 use crate::AsRawDescriptor;
+use crate::Error;
+use crate::Result;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum FileFlags {
@@ -24,6 +24,7 @@ pub enum FileFlags {
 
 impl FileFlags {
     pub fn from_file(file: &dyn AsRawDescriptor) -> Result<FileFlags> {
+        // SAFETY:
         // Trivially safe because fcntl with the F_GETFL command is totally safe and we check for
         // error.
         let flags = unsafe { fcntl(file.as_raw_descriptor(), F_GETFL) };
@@ -42,8 +43,8 @@ impl FileFlags {
 
 #[cfg(test)]
 mod tests {
-    use super::super::pipe;
     use super::*;
+    use crate::sys::pipe;
     use crate::Event;
 
     #[test]

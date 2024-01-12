@@ -18,11 +18,11 @@ underlying platform. The users of this module, `sys`, get to use an aliased stru
 which exports similar interfaces on both the platforms.
 
 In this scheme `print.rs` contains platform agnostic logic, structures and traits. Different
-platforms, in `unix.rs` and `windows.rs`, implement traits defined in `print.rs`. Finally `sys.rs`
+platforms, in `linux.rs` and `windows.rs`, implement traits defined in `print.rs`. Finally `sys.rs`
 exports interfaces implemented by platform specific code.
 
 In a more complex library, we may need another layer, `print.rs`, that uses traits and structures
-exported by platform specific code, `unix/print.rs` and `windows/print.rs`, and adds some more
+exported by platform specific code, `linux/print.rs` and `windows/print.rs`, and adds some more
 common logic to it. Following example illustrates the scheme discussed above. Here,
 `Printer.print()` is supposed to print a value of `u32` and print the target os name.
 
@@ -35,9 +35,9 @@ $  tree
 .
 ├── print.rs
 ├── sys
-│   ├── unix
+│   ├── linux
 │   │   └── print.rs
-│   ├── unix.rs
+│   ├── linux.rs
 │   ├── windows
 │   │   └── print.rs
 │   └── windows.rs
@@ -96,16 +96,16 @@ impl Print for WinPrinter {
 }
 ```
 
-File: `sys/unix/print.rs`
+File: `sys/linux/print.rs`
 
 ```rust
 use crate::print::{Print, PrintInner};
 
-pub struct UnixPrinter {
+pub struct LinuxPrinter {
     inner: PrintInner,
 }
 
-impl UnixPrinter {
+impl LinuxPrinter {
     pub fn new(value: u32) -> Self {
         Self {
             inner: PrintInner::new(value),
@@ -113,10 +113,10 @@ impl UnixPrinter {
     }
 }
 
-impl Print for UnixPrinter {
+impl Print for LinuxPrinter {
     fn print(&self) {
         self.inner.print();
-        println!("from unix");
+        println!("from linux");
     }
 }
 ```
@@ -124,26 +124,33 @@ impl Print for UnixPrinter {
 File: `sys.rs`
 
 ```rust
-cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        mod unix;
-        pub use platform_print::UnixPrinter as Printer;
-    } else if #[cfg(windows)] {
-        mod windows;
-        pub use platform_print::WinPrinter as Printer;
-    }
+#[cfg(any(target_os = "android", target_os = "linux"))]
+mod linux;
+
+#[cfg(windows)]
+mod windows;
+
+mod platform {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    pub use super::linux::LinuxPrinter as Printer;
+
+    #[cfg(windows)]
+    pub use super::windows::WinPrinter as Printer;
 }
+
+pub use platform::Printer;
 ```
 
 ## Imports
 
-When conditionally importing and using modules, use `cfg(unix)` and `cfg(windows)` for describing
-the platform. Order imports such that common comes first followed by unix and windows dependencies.
+When conditionally importing and using modules, use
+`cfg(any(target_os = "android", target_os = "linux"))` and `cfg(windows)` for describing the
+platform. Order imports such that common comes first followed by linux and windows dependencies.
 
 ```rust
 // All other imports
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use {
   std::x::y,
   base::a::b::{Foo, Bar},
@@ -164,7 +171,7 @@ It is OK to have a few platform specific fields inlined with cfgs. When inlining
 
 - Ensure that all the fields of a particular platform are next to each other.
 - Organize common fields first and then platform specific fields ordered by the target os name i.e.
-  "unix" first and "windows" later.
+  "linux" first and "windows" later.
 
 If the structure has a large set of fields that are platform specific, it is more readable to split
 it into different platform specific structures and have their implementations separate. If
@@ -181,7 +188,7 @@ When enums need to have platform specific variants
 
 ### Do
 
-File: `sys/unix/base.rs`
+File: `sys/linux/base.rs`
 
 ```rust
 enum MyEnumSys {
@@ -238,7 +245,7 @@ enum MyEnum {
   Common2,
   #[cfg(target_os = "windows")]
   Windows1, // We shouldn't have platform-specific variants in a platform-independent enum.
-  #[cfg(target_os = "unix")]
+  #[cfg(any(target_os = "android", target_os = "linux"))]
   Unix1, // We shouldn't have platform-specific variants in a platform-independent enum.
 }
 
@@ -248,7 +255,7 @@ fn handle_my_enum(e: MyEnum) {
     Common2 => {..},
     #[cfg(target_os = "windows")]
     Windows1 => {..}, // We shouldn't have platform-specific match arms in a platform-independent code.
-    #[cfg(target_os = "unix")]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     Unix1 => {..}, // We shouldn't have platform-specific match arms in a platform-independent code.
   };
 }
@@ -272,11 +279,11 @@ fn my_func() {
 }
 ```
 
-File: `sys/unix/base.rs`
+File: `sys/linux/base.rs`
 
 ```rust
 fn my_func_impl() {
-  println!("unix");
+  println!("linux");
 }
 ```
 
@@ -296,8 +303,8 @@ File: `base.rs`
 fn my_func() {
   print!("Hello ");
 
-  #[cfg(target_os = "unix")] {
-    println!("unix"); // We shouldn't have platform-specific code in a platform-independent code block.
+  #[cfg(any(target_os = "android", target_os = "linux"))] {
+    println!("linux"); // We shouldn't have platform-specific code in a platform-independent code block.
   }
 
   #[cfg(target_os = "windows")] {
@@ -327,7 +334,7 @@ fn parse_args(arg: &str) -> Result<()>{
 }
 ```
 
-File: `sys/unix/parse.rs`
+File: `sys/linux/parse.rs`
 
 ```rust
 fn parse_args_impl(arg: &str) -> Result<()>{
@@ -363,7 +370,7 @@ File: `parse.rs`
 fn parse_args(arg: &str) -> Result<()>{
   match arg {
     "path" => Ok(()),
-    #[cfg(target_os = "unix")]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     "fd" => { // We shouldn't have platform-specific match arms in a platform-independent code.
       <multiple lines of logic>;
       Ok(())
@@ -382,7 +389,7 @@ fn parse_args(arg: &str) -> Result<()>{
 
 Inlining all platform specific error values is ok. This is an exception to the [enum](#enum) to keep
 error handling simple. Organize platform independent errors first and then platform specific errors
-ordered by the target os name i.e. "unix" first and "windows" later.
+ordered by the target os name i.e. "linux" first and "windows" later.
 
 ## Platform specific symbols
 
@@ -394,9 +401,9 @@ File: `sys.rs`
 
 ```rust
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        pub mod unix;
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        pub mod linux;
+        use linux as platform;
     } else if #[cfg(windows)] {
         pub mod windows;
         use windows as platform;
@@ -406,11 +413,11 @@ cfg_if::cfg_if! {
 pub use platform::print;
 ```
 
-File: `unix.rs`
+File: `linux.rs`
 
 ```rust
 fn print() {
-  println!("Hello unix");
+  println!("Hello linux");
 }
 
 fn print_u8(val: u8) {
@@ -441,8 +448,8 @@ use mylib::sys::print;
 fn my_print() {
   print();
 
-  #[cfg(unix)]
-  mylib::sys::unix::print_u8(1);
+  #[cfg(any(target_os = "android", target_os = "linux"))]
+  mylib::sys::linux::print_u8(1);
 
   #[cfg(windows)]
   mylib::sys::windows::print_u16(1);

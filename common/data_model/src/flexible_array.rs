@@ -11,9 +11,7 @@ use std::mem::size_of;
 fn vec_with_size_in_bytes<T: Default>(size_in_bytes: usize) -> Vec<T> {
     let rounded_size = (size_in_bytes + size_of::<T>() - 1) / size_of::<T>();
     let mut v = Vec::with_capacity(rounded_size);
-    for _ in 0..rounded_size {
-        v.push(T::default())
-    }
+    v.resize_with(rounded_size, T::default);
     v
 }
 
@@ -151,6 +149,7 @@ where
     /// mut_entries_slice instead.
     pub fn entries_slice(&self) -> &[S] {
         let valid_length = self.get_valid_len();
+        // SAFETY:
         // Safe because the length has been validated.
         unsafe { self.entries[0].get_slice(valid_length) }
     }
@@ -159,6 +158,7 @@ where
     pub fn mut_entries_slice(&mut self) -> &mut [S] {
         let valid_length = self.get_valid_len();
         self.entries[0].set_len(valid_length);
+        // SAFETY:
         // Safe because the length has been validated.
         unsafe { self.entries[0].get_mut_slice(valid_length) }
     }

@@ -16,8 +16,8 @@ pub mod gdb;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
-#[cfg(unix)]
-use base::MemoryMappingBuilderUnix;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::linux::MemoryMappingBuilderUnix;
 #[cfg(windows)]
 use base::MemoryMappingBuilderWindows;
 use hypervisor::BalloonEvent;
@@ -28,6 +28,8 @@ mod balloon_tube;
 pub mod client;
 pub mod sys;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::_rdtsc;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -89,11 +91,11 @@ use serde::Deserialize;
 use serde::Serialize;
 use swap::SwapStatus;
 use sync::Mutex;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub use sys::FsMappingRequest;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub use sys::VmMsyncRequest;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub use sys::VmMsyncResponse;
 use thiserror::Error;
 pub use vm_control_product::GpuSendToMain;
@@ -124,7 +126,17 @@ pub enum VcpuControl {
     // Request the current state of the vCPU. The result is sent back over the included channel.
     GetStates(mpsc::Sender<VmRunMode>),
     Snapshot(mpsc::Sender<anyhow::Result<VcpuSnapshot>>),
-    Restore(mpsc::Sender<anyhow::Result<()>>, Box<VcpuSnapshot>),
+    Restore(VcpuRestoreRequest),
+}
+
+/// Request to restore a Vcpu from a given snapshot, and report the results
+/// back via the provided channel.
+#[derive(Clone, Debug)]
+pub struct VcpuRestoreRequest {
+    pub result_sender: mpsc::Sender<anyhow::Result<()>>,
+    pub snapshot: Box<VcpuSnapshot>,
+    #[cfg(target_arch = "x86_64")]
+    pub host_tsc_reference_moment: u64,
 }
 
 /// Mode of execution for the VM.
@@ -377,6 +389,7 @@ pub enum VmMemorySource {
 
 // The following are wrappers to avoid base dependencies in the rutabaga crate
 fn to_rutabaga_desciptor(s: SafeDescriptor) -> RutabagaDescriptor {
+    // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
     unsafe { RutabagaDescriptor::from_raw_descriptor(s.into_raw_descriptor()) }
 }
@@ -391,6 +404,10 @@ impl RutabagaMemoryRegion {
     }
 }
 
+// SAFETY:
+//
+// Self guarantees `ptr`..`ptr+size` is an mmaped region owned by this object that
+// can't be unmapped during the `MappedRegion`'s lifetime.
 unsafe impl MappedRegion for RutabagaMemoryRegion {
     fn as_ptr(&self) -> *mut u8 {
         self.region.as_ptr()
@@ -1726,6 +1743,7 @@ impl VmRequest {
                 VmResponse::Err(SysError::new(ENOTSUP))
             }
             VmRequest::SuspendVm => {
+                info!("Starting crosvm suspend");
                 kick_vcpus(VcpuControl::RunState(VmRunMode::Suspending));
                 let current_mode = match get_vcpu_state(kick_vcpus, vcpu_size) {
                     Ok(state) => state,
@@ -1749,7 +1767,10 @@ impl VmRequest {
                     .recv()
                     .context("receive from devices control socket")
                 {
-                    Ok(VmResponse::Ok) => VmResponse::Ok,
+                    Ok(VmResponse::Ok) => {
+                        info!("Finished crosvm suspend successfully");
+                        VmResponse::Ok
+                    }
                     Ok(resp) => {
                         error!("device sleep failed: {}", resp);
                         VmResponse::Err(SysError::new(EIO))
@@ -1761,6 +1782,7 @@ impl VmRequest {
                 }
             }
             VmRequest::ResumeVm => {
+                info!("Starting crosvm resume");
                 if let Err(e) = device_control_tube
                     .send(&DeviceControlCommand::WakeDevices)
                     .context("send command to devices control socket")
@@ -1772,7 +1794,9 @@ impl VmRequest {
                     .recv()
                     .context("receive from devices control socket")
                 {
-                    Ok(VmResponse::Ok) => (),
+                    Ok(VmResponse::Ok) => {
+                        info!("Finished crosvm resume successfully");
+                    }
                     Ok(resp) => {
                         error!("device wake failed: {}", resp);
                         return VmResponse::Err(SysError::new(EIO));
@@ -1889,6 +1913,7 @@ impl VmRequest {
                 VmResponse::ErrString("hot plug not supported".to_owned())
             }
             VmRequest::Snapshot(SnapshotCommand::Take { ref snapshot_path }) => {
+                info!("Starting crosvm snapshot");
                 match do_snapshot(
                     snapshot_path.to_path_buf(),
                     kick_vcpus,
@@ -1897,7 +1922,10 @@ impl VmRequest {
                     vcpu_size,
                     snapshot_irqchip,
                 ) {
-                    Ok(()) => VmResponse::Ok,
+                    Ok(()) => {
+                        info!("Finished crosvm snapshot successfully");
+                        VmResponse::Ok
+                    }
                     Err(e) => {
                         error!("failed to handle snapshot: {:?}", e);
                         VmResponse::Err(SysError::new(EIO))
@@ -1905,6 +1933,7 @@ impl VmRequest {
                 }
             }
             VmRequest::Restore(RestoreCommand::Apply { ref restore_path }) => {
+                info!("Starting crosvm restore");
                 match do_restore(
                     restore_path.clone(),
                     kick_vcpus,
@@ -1914,7 +1943,10 @@ impl VmRequest {
                     vcpu_size,
                     restore_irqchip,
                 ) {
-                    Ok(()) => VmResponse::Ok,
+                    Ok(()) => {
+                        info!("Finished crosvm restore successfully");
+                        VmResponse::Ok
+                    }
                     Err(e) => {
                         error!("failed to handle restore: {:?}", e);
                         VmResponse::Err(SysError::new(EIO))
@@ -2068,18 +2100,30 @@ pub fn do_restore(
             vcpu_snapshots.len()
         );
     }
+
+    #[cfg(target_arch = "x86_64")]
+    let host_tsc_reference_moment = {
+        // SAFETY: rdtsc takes no arguments.
+        unsafe { _rdtsc() }
+    };
     let (send_chan, recv_chan) = mpsc::channel();
     for vcpu_snap in vcpu_snapshots {
         let vcpu_id = vcpu_snap.vcpu_id;
         kick_vcpu(
-            VcpuControl::Restore(send_chan.clone(), Box::new(vcpu_snap)),
+            VcpuControl::Restore(VcpuRestoreRequest {
+                result_sender: send_chan.clone(),
+                snapshot: Box::new(vcpu_snap),
+                #[cfg(target_arch = "x86_64")]
+                host_tsc_reference_moment,
+            }),
             vcpu_id,
         );
     }
     for _ in 0..vcpu_size {
-        if let Err(e) = recv_chan.recv() {
-            bail!("Failed to restore vcpu: {}", e);
-        }
+        recv_chan
+            .recv()
+            .context("Failed to recv restore response")?
+            .context("Failed to restore vcpu")?;
     }
 
     // Restore devices

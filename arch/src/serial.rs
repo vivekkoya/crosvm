@@ -17,7 +17,7 @@ use hypervisor::ProtectionType;
 use jail::read_jail_addr;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use minijail::Minijail;
 use remain::sorted;
 use thiserror::Error as ThisError;
@@ -47,6 +47,7 @@ pub fn set_default_serial_parameters(
             .or_insert(SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::Serial,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,
@@ -66,6 +67,7 @@ pub fn set_default_serial_parameters(
         serial_parameters.entry(key).or_insert(SerialParameters {
             type_: SerialType::Sink,
             hardware: SerialHardware::Serial,
+            name: None,
             path: None,
             input: None,
             num,
@@ -123,7 +125,7 @@ pub fn add_serial_devices(
             .create_serial_device::<Serial>(protection_type, com_evt, &mut preserved_descriptors)
             .map_err(DeviceRegistrationError::CreateSerialDevice)?;
 
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let serial_jail = if let Some(serial_jail) = serial_jail.as_ref() {
             let jail_clone = serial_jail
                 .try_clone()
@@ -252,6 +254,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::VirtioConsole,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,
@@ -282,6 +285,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::VirtioConsole,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,
@@ -299,6 +303,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::Serial,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,
@@ -330,6 +335,7 @@ mod tests {
             SerialParameters {
                 type_: SerialType::Stdout,
                 hardware: SerialHardware::VirtioConsole,
+                name: None,
                 path: None,
                 input: None,
                 num: 1,

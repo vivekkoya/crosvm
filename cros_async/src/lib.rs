@@ -66,8 +66,8 @@ mod queue;
 mod select;
 pub mod sync;
 pub mod sys;
-#[cfg(unix)]
-pub use sys::unix::uring_executor::is_uring_stable;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use sys::linux::uring_executor::is_uring_stable;
 pub use sys::Executor;
 pub use sys::ExecutorKind;
 pub use sys::TaskHandle;
@@ -81,8 +81,8 @@ use std::task::Poll;
 
 pub use async_types::*;
 pub use base::Event;
-#[cfg(unix)]
-pub use blocking::sys::unix::block_on::block_on;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub use blocking::sys::linux::block_on::block_on;
 pub use blocking::unblock;
 pub use blocking::unblock_disarm;
 pub use blocking::BlockingPool;
@@ -96,7 +96,6 @@ pub use io_ext::AsyncWrapper;
 pub use io_ext::Error as AsyncError;
 pub use io_ext::IntoAsync;
 pub use io_ext::Result as AsyncResult;
-pub use io_source::AllocateMode;
 pub use io_source::IoSource;
 pub use mem::BackingMemory;
 pub use mem::MemRegion;
@@ -120,9 +119,9 @@ pub enum Error {
     #[error("IO error: {0}")]
     Io(std::io::Error),
     /// Error from the polled(FD) source, which includes error from the FD executor.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("An error with a poll source: {0}")]
-    PollSource(sys::unix::poll_source::Error),
+    PollSource(sys::linux::poll_source::Error),
     /// Error from Timer.
     #[error("Failure in Timer: {0}")]
     Timer(base::Error),
@@ -130,9 +129,9 @@ pub enum Error {
     #[error("Failure in TimerAsync: {0}")]
     TimerAsync(AsyncError),
     /// Error from the uring executor.
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[error("Failure in the uring executor: {0}")]
-    URingExecutor(sys::unix::uring_executor::Error),
+    URingExecutor(sys::linux::uring_executor::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;
 

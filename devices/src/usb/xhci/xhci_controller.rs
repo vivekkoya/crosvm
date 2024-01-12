@@ -10,6 +10,7 @@ use std::sync::Arc;
 use base::error;
 use base::AsRawDescriptor;
 use base::RawDescriptor;
+use base::SharedMemory;
 use resources::Alloc;
 use resources::AllocOptions;
 use resources::SystemAllocator;
@@ -284,7 +285,19 @@ impl PciDevice for XhciController {
     }
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
-        self.config_regs.write_reg(reg_idx, offset, data)
+        self.config_regs.write_reg(reg_idx, offset, data);
+    }
+
+    fn setup_pci_config_mapping(
+        &mut self,
+        shmem: &SharedMemory,
+        base: usize,
+        len: usize,
+    ) -> Result<bool, PciDeviceError> {
+        self.config_regs
+            .setup_mapping(shmem, base, len)
+            .map(|_| true)
+            .map_err(PciDeviceError::MmioSetup)
     }
 
     fn read_bar(&mut self, bar_index: usize, offset: u64, data: &mut [u8]) {

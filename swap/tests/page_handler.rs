@@ -15,6 +15,7 @@ use std::thread;
 use std::time;
 
 use base::pagesize;
+use base::test_utils::call_test_with_sudo;
 use base::MappedRegion;
 use base::MemoryMappingBuilder;
 use base::SharedMemory;
@@ -29,6 +30,12 @@ const HUGEPAGE_SIZE: usize = 2 * 1024 * 1024; // 2MB
 
 #[test]
 fn create_success() {
+    call_test_with_sudo("create_success_impl")
+}
+
+#[ignore = "Only to be called by create_success"]
+#[test]
+fn create_success_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 6 * pagesize() as u64).unwrap();
@@ -51,6 +58,12 @@ fn create_success() {
 
 #[test]
 fn create_partially_overlap() {
+    call_test_with_sudo("create_partially_overlap_impl")
+}
+
+#[ignore = "Only to be called by create_partially_overlap"]
+#[test]
+fn create_partially_overlap_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
@@ -88,18 +101,20 @@ fn create_partially_overlap() {
 
 #[test]
 fn create_invalid_range() {
+    call_test_with_sudo("create_invalid_range_impl")
+}
+
+#[ignore = "Only to be called by create_invalid_range"]
+#[test]
+fn create_invalid_range_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 6 * pagesize() as u64).unwrap();
     let shm = create_shared_memory("shm", 6 * pagesize());
     let base_addr = shm.base_addr();
+    let region = base_addr..(base_addr - pagesize());
 
-    let result = PageHandler::create(
-        &file,
-        &staging_shmem,
-        &[base_addr..(base_addr - pagesize())],
-        worker.channel.clone(),
-    );
+    let result = PageHandler::create(&file, &staging_shmem, &[region], worker.channel.clone());
 
     assert!(result.is_err());
     worker.close();
@@ -117,15 +132,24 @@ fn wait_thread_with_timeout<T>(join_handle: thread::JoinHandle<T>, timeout_milli
 
 #[test]
 fn handle_page_fault_zero_success() {
+    call_test_with_sudo("handle_page_fault_zero_success_impl")
+}
+
+#[ignore = "Only to be called by handle_page_fault_zero_success"]
+#[test]
+fn handle_page_fault_zero_success_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let uffd = create_uffd_for_test();
     let shm = create_shared_memory("shm", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     page_handler.handle_page_fault(&uffd, base_addr).unwrap();
@@ -141,6 +165,7 @@ fn handle_page_fault_zero_success() {
         let mut result = Vec::new();
         for i in 0..(3 * pagesize()) {
             let ptr = shm.mmap.as_ptr() as usize + i;
+            // SAFETY: trivially safe
             unsafe {
                 result.push(*(ptr as *mut u8));
             }
@@ -156,15 +181,24 @@ fn handle_page_fault_zero_success() {
 
 #[test]
 fn handle_page_fault_invalid_address() {
+    call_test_with_sudo("handle_page_fault_invalid_address_impl")
+}
+
+#[ignore = "Only to be called by handle_page_fault_invalid_address"]
+#[test]
+fn handle_page_fault_invalid_address_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let uffd = create_uffd_for_test();
     let shm = create_shared_memory("shm", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     assert_eq!(
@@ -184,15 +218,24 @@ fn handle_page_fault_invalid_address() {
 
 #[test]
 fn handle_page_fault_duplicated_page_fault() {
+    call_test_with_sudo("handle_page_fault_duplicated_page_fault_impl")
+}
+
+#[ignore = "Only to be called by handle_page_fault_duplicated_page_fault"]
+#[test]
+fn handle_page_fault_duplicated_page_fault_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let uffd = create_uffd_for_test();
     let shm = create_shared_memory("shm", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     assert_eq!(
@@ -208,15 +251,24 @@ fn handle_page_fault_duplicated_page_fault() {
 
 #[test]
 fn handle_page_remove_success() {
+    call_test_with_sudo("handle_page_remove_success_impl")
+}
+
+#[ignore = "Only to be called by handle_page_remove_success"]
+#[test]
+fn handle_page_remove_success_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let uffd = create_uffd_for_test();
     let shm = create_shared_memory("shm", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     // fill the first page with zero
@@ -224,6 +276,7 @@ fn handle_page_remove_success() {
     // write value on another thread to avoid blocking forever
     let join_handle = thread::spawn(move || {
         let ptr = base_addr as *mut u8;
+        // SAFETY: trivially safe
         unsafe {
             *ptr = 1;
         }
@@ -233,6 +286,8 @@ fn handle_page_remove_success() {
     page_handler
         .handle_page_remove(base_addr, second_page_addr)
         .unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         libc::madvise(
             base_addr as *mut libc::c_void,
@@ -245,6 +300,7 @@ fn handle_page_remove_success() {
     // read value on another thread to avoid blocking forever
     let join_handle = thread::spawn(move || {
         let ptr = base_addr as *mut u8;
+        // SAFETY: trivially safe
         unsafe { *ptr }
     });
 
@@ -254,15 +310,24 @@ fn handle_page_remove_success() {
 
 #[test]
 fn handle_page_remove_invalid_address() {
+    call_test_with_sudo("handle_page_remove_invalid_address_impl")
+}
+
+#[ignore = "Only to be called by handle_page_remove_invalid_address"]
+#[test]
+fn handle_page_remove_invalid_address_impl() {
     let worker = Worker::new(2, 2);
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let uffd = create_uffd_for_test();
     let shm = create_shared_memory("shm", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     page_handler.handle_page_fault(&uffd, base_addr).unwrap();
@@ -296,6 +361,12 @@ fn handle_page_remove_invalid_address() {
 
 #[test]
 fn move_to_staging_data_written_before_enabling() {
+    call_test_with_sudo("move_to_staging_data_written_before_enabling_impl")
+}
+
+#[ignore = "Only to be called by move_to_staging_data_written_before_enabling"]
+#[test]
+fn move_to_staging_data_written_before_enabling_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -320,6 +391,8 @@ fn move_to_staging_data_written_before_enabling() {
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
     // write data before registering to userfaultfd
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr1 + pagesize()..base_addr1 + 2 * pagesize() {
             *(i as *mut u8) = 1;
@@ -331,8 +404,12 @@ fn move_to_staging_data_written_before_enabling() {
             *(i as *mut u8) = 3;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -356,6 +433,7 @@ fn move_to_staging_data_written_before_enabling() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr1 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -364,6 +442,7 @@ fn move_to_staging_data_written_before_enabling() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr2 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -391,6 +470,12 @@ fn page_idx_to_addr(page_idx: usize) -> usize {
 
 #[test]
 fn move_to_staging_hugepage_chunks() {
+    call_test_with_sudo("move_to_staging_hugepage_chunks_impl")
+}
+
+#[ignore = "Only to be called by move_to_staging_hugepage_chunks"]
+#[test]
+fn move_to_staging_hugepage_chunks_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -416,6 +501,8 @@ fn move_to_staging_hugepage_chunks() {
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
     // write data before registering to userfaultfd
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in page_idx_range(base_addr1 + pagesize(), base_addr1 + 3 * pagesize()) {
             *(page_idx_to_addr(i) as *mut u8) = 1;
@@ -442,8 +529,12 @@ fn move_to_staging_hugepage_chunks() {
             *(page_idx_to_addr(i) as *mut u8) = 5;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -466,12 +557,14 @@ fn move_to_staging_hugepage_chunks() {
         let mut result = Vec::new();
         for i in page_idx_range(base_addr1, base_addr1 + 5 * HUGEPAGE_SIZE) {
             let ptr = (page_idx_to_addr(i)) as *mut u8;
+            // SAFETY: trivially safe
             unsafe {
                 result.push(*ptr);
             }
         }
         for i in page_idx_range(base_addr2, base_addr2 + 5 * HUGEPAGE_SIZE) {
             let ptr = (page_idx_to_addr(i)) as *mut u8;
+            // SAFETY: trivially safe
             unsafe {
                 result.push(*ptr);
             }
@@ -520,25 +613,50 @@ fn move_to_staging_hugepage_chunks() {
 
 #[test]
 fn move_to_staging_invalid_base_addr() {
+    call_test_with_sudo("move_to_staging_invalid_base_addr_impl")
+}
+
+#[ignore = "Only to be called by move_to_staging_invalid_base_addr"]
+#[test]
+fn move_to_staging_invalid_base_addr_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
     let staging_shmem = SharedMemory::new("test staging memory", 3 * pagesize() as u64).unwrap();
     let shm = create_shared_memory("shm1", 3 * pagesize());
     let base_addr = shm.base_addr();
-    let regions = [base_addr..(base_addr + 3 * pagesize())];
+    let region = base_addr..(base_addr + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
     // the base_addr is within the region
     assert_eq!(
-        unsafe { page_handler.move_to_staging(base_addr + pagesize(), &shm.shm, 0,) }.is_err(),
+        {
+            // TODO(b/315998194): Add safety comment
+            #[allow(clippy::undocumented_unsafe_blocks)]
+            unsafe {
+                page_handler
+                    .move_to_staging(base_addr + pagesize(), &shm.shm, 0)
+                    .is_err()
+            }
+        },
         true
     );
     // the base_addr is outside of the region
     assert_eq!(
-        unsafe { page_handler.move_to_staging(base_addr - pagesize(), &shm.shm, 0,) }.is_err(),
+        {
+            // TODO(b/315998194): Add safety comment
+            #[allow(clippy::undocumented_unsafe_blocks)]
+            unsafe {
+                page_handler
+                    .move_to_staging(base_addr - pagesize(), &shm.shm, 0)
+                    .is_err()
+            }
+        },
         true
     );
     worker.close();
@@ -550,6 +668,12 @@ fn swap_out_all(page_handler: &PageHandler) {
 
 #[test]
 fn swap_out_success() {
+    call_test_with_sudo("swap_out_success_impl")
+}
+
+#[ignore = "Only to be called by swap_out_success"]
+#[test]
+fn swap_out_success_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -573,6 +697,8 @@ fn swap_out_success() {
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
     // write data before registering to userfaultfd
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr1 + pagesize()..base_addr1 + 2 * pagesize() {
             *(i as *mut u8) = 1;
@@ -581,8 +707,12 @@ fn swap_out_success() {
             *(i as *mut u8) = 2;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -608,6 +738,7 @@ fn swap_out_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr1 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -616,6 +747,7 @@ fn swap_out_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr2 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -635,6 +767,12 @@ fn swap_out_success() {
 
 #[test]
 fn swap_out_handled_page() {
+    call_test_with_sudo("swap_out_handled_page_impl")
+}
+
+#[ignore = "Only to be called by swap_out_handled_page"]
+#[test]
+fn swap_out_handled_page_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -646,17 +784,24 @@ fn swap_out_handled_page() {
         .unwrap();
     let base_addr1 = mmap1.as_ptr() as usize;
 
-    let regions = [base_addr1..(base_addr1 + 3 * pagesize())];
+    let region = base_addr1..(base_addr1 + 3 * pagesize());
+    let regions = [region];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
     // write data before registering to userfaultfd
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr1 + pagesize()..base_addr1 + 2 * pagesize() {
             *(i as *mut u8) = 1;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
     }
@@ -672,6 +817,7 @@ fn swap_out_handled_page() {
         let mut result = Vec::new();
         for i in 0..pagesize() {
             let ptr = (base_addr1 + pagesize() + i) as *mut u8;
+            // SAFETY: trivially safe
             unsafe {
                 result.push(*ptr);
             }
@@ -688,6 +834,12 @@ fn swap_out_handled_page() {
 
 #[test]
 fn swap_out_twice() {
+    call_test_with_sudo("swap_out_twice_impl")
+}
+
+#[ignore = "Only to be called by swap_out_twice"]
+#[test]
+fn swap_out_twice_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -710,6 +862,8 @@ fn swap_out_twice() {
     ];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in 0..pagesize() {
             *((base_addr1 + i) as *mut u8) = 1;
@@ -718,8 +872,12 @@ fn swap_out_twice() {
             *((base_addr2 + 2 * pagesize() + i) as *mut u8) = 4;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -738,18 +896,22 @@ fn swap_out_twice() {
     let join_handle = thread::spawn(move || {
         for i in 0..pagesize() {
             let ptr = (base_addr1 + pagesize() + i) as *mut u8;
+            // SAFETY: trivially safe
             unsafe {
                 *ptr = 5;
             }
         }
         for i in 0..pagesize() {
             let ptr = (base_addr1 + 2 * pagesize() + i) as *mut u8;
+            // SAFETY: trivially safe
             unsafe {
                 *ptr = 6;
             }
         }
     });
     wait_thread_with_timeout(join_handle, 100);
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -774,6 +936,7 @@ fn swap_out_twice() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr1 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -782,6 +945,7 @@ fn swap_out_twice() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr2 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -801,6 +965,12 @@ fn swap_out_twice() {
 
 #[test]
 fn swap_in_success() {
+    call_test_with_sudo("swap_in_success_impl")
+}
+
+#[ignore = "Only to be called by swap_in_success"]
+#[test]
+fn swap_in_success_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -823,6 +993,8 @@ fn swap_in_success() {
     ];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr1 + pagesize()..base_addr1 + 2 * pagesize() {
             *(i as *mut u8) = 1;
@@ -834,8 +1006,12 @@ fn swap_in_success() {
             *(i as *mut u8) = 3;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -850,12 +1026,16 @@ fn swap_in_success() {
     page_handler
         .handle_page_fault(&uffd, base_addr2 + pagesize())
         .unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr2 + pagesize()..base_addr2 + 2 * pagesize() {
             *(i as *mut u8) = 4;
         }
     }
     // move to staging memory.
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler
             .move_to_staging(base_addr2, &shm, 3 * pagesize() as u64)
@@ -872,6 +1052,7 @@ fn swap_in_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr1 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -880,6 +1061,7 @@ fn swap_in_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr2 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -899,6 +1081,12 @@ fn swap_in_success() {
 
 #[test]
 fn trim_success() {
+    call_test_with_sudo("trim_success_impl")
+}
+
+#[ignore = "Only to be called by trim_success"]
+#[test]
+fn trim_success_impl() {
     let worker = Worker::new(2, 2);
     let uffd = create_uffd_for_test();
     let file = tempfile::tempfile().unwrap();
@@ -921,6 +1109,8 @@ fn trim_success() {
     ];
     let page_handler =
         PageHandler::create(&file, &staging_shmem, &regions, worker.channel.clone()).unwrap();
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr1..base_addr1 + pagesize() {
             *(i as *mut u8) = 0;
@@ -938,8 +1128,12 @@ fn trim_success() {
             *(i as *mut u8) = 3;
         }
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe { register_regions(&regions, array::from_ref(&uffd)) }.unwrap();
 
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -967,6 +1161,8 @@ fn trim_success() {
             .handle_page_fault(&uffd, base_addr2 + i * pagesize())
             .unwrap();
     }
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         for i in base_addr2 + pagesize()..base_addr2 + 2 * pagesize() {
             *(i as *mut u8) = 4;
@@ -974,6 +1170,8 @@ fn trim_success() {
     }
 
     // move to staging memory.
+    // TODO(b/315998194): Add safety comment
+    #[allow(clippy::undocumented_unsafe_blocks)]
     unsafe {
         page_handler.move_to_staging(base_addr1, &shm, 0).unwrap();
         page_handler
@@ -1003,6 +1201,7 @@ fn trim_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr1 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }
@@ -1011,6 +1210,7 @@ fn trim_success() {
         for i in 0..3 {
             for j in 0..pagesize() {
                 let ptr = (base_addr2 + i * pagesize() + j) as *mut u8;
+                // SAFETY: trivially safe
                 unsafe {
                     result.push(*ptr);
                 }

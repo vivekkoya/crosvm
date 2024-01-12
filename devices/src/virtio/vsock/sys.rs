@@ -3,9 +3,9 @@
 // found in the LICENSE file.
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        mod unix;
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        mod linux;
+        use linux as platform;
         pub use crate::virtio::vhost::Vsock;
     } else if #[cfg(windows)] {
         mod windows;

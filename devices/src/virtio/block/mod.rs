@@ -16,7 +16,6 @@ pub mod asynchronous;
 pub(crate) mod sys;
 
 pub use asynchronous::BlockAsync;
-pub use asynchronous::DiskState;
 
 fn block_option_sparse_default() -> bool {
     true
@@ -464,7 +463,7 @@ mod tests {
         // async-executor
         #[cfg(windows)]
         let (ex_kind, ex_kind_opt) = (ExecutorKind::Handle, "handle");
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let (ex_kind, ex_kind_opt) = (ExecutorKind::Fd, "epoll");
         let params =
             from_block_arg(&format!("/some/path.img,async-executor={ex_kind_opt}")).unwrap();

@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use arch::get_serial_cmdline;
+use arch::DtbOverlay;
 use arch::GetSerialCmdlineError;
 use arch::RunnableLinuxVm;
 use arch::VmComponents;
@@ -24,6 +25,7 @@ use devices::serial_device::SerialParameters;
 use devices::Bus;
 use devices::BusDeviceObj;
 use devices::BusError;
+use devices::BusType;
 use devices::IrqChipRiscv64;
 use devices::PciAddress;
 use devices::PciConfigMmio;
@@ -45,13 +47,13 @@ use hypervisor::Vm;
 use hypervisor::VmRiscv64;
 #[cfg(windows)]
 use jail::FakeMinijailStub as Minijail;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use minijail::Minijail;
 use remain::sorted;
 use resources::AddressRange;
 use resources::SystemAllocator;
 use resources::SystemAllocatorConfig;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use sync::Condvar;
 use sync::Mutex;
 use thiserror::Error;
@@ -188,7 +190,10 @@ impl arch::LinuxArch for Riscv64 {
         _dump_device_tree_blob: Option<PathBuf>,
         _debugcon_jail: Option<Minijail>,
         #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
-        #[cfg(unix)] _guest_suspended_cvar: Option<Arc<(Mutex<bool>, Condvar)>>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] _guest_suspended_cvar: Option<
+            Arc<(Mutex<bool>, Condvar)>,
+        >,
+        device_tree_overlays: Vec<DtbOverlay>,
     ) -> std::result::Result<RunnableLinuxVm<V, Vcpu>, Self::Error>
     where
         V: VmRiscv64,
@@ -200,10 +205,10 @@ impl arch::LinuxArch for Riscv64 {
 
         let mem = vm.get_memory().clone();
 
-        let mmio_bus = Arc::new(Bus::new());
+        let mmio_bus = Arc::new(Bus::new(BusType::Mmio));
 
         // Riscv doesn't really use the io bus like x86, so just create an empty bus.
-        let io_bus = Arc::new(Bus::new());
+        let io_bus = Arc::new(Bus::new(BusType::Io));
 
         let com_evt_1_3 = Event::new().map_err(Error::CreateEvent)?;
         let com_evt_2_4 = Event::new().map_err(Error::CreateEvent)?;
@@ -231,6 +236,8 @@ impl arch::LinuxArch for Riscv64 {
                 pci_devices,
                 irq_chip.as_irq_chip_mut(),
                 Arc::clone(&mmio_bus),
+                GuestAddress(RISCV64_PCI_CFG_BASE),
+                8,
                 Arc::clone(&io_bus),
                 system_allocator,
                 &mut vm,
@@ -251,14 +258,16 @@ impl arch::LinuxArch for Riscv64 {
             .into_iter()
             .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
             .collect();
-        let (platform_devices, mut platform_pid_debug_label_map) =
-            arch::sys::unix::generate_platform_bus(
+        let (platform_devices, mut platform_pid_debug_label_map, dev_resources) =
+            arch::sys::linux::generate_platform_bus(
                 platform_devices,
                 irq_chip.as_irq_chip_mut(),
                 &mmio_bus,
                 system_allocator,
+                &mut vm,
                 #[cfg(feature = "swap")]
                 swap_controller,
+                components.hv_cfg.protection_type,
             )
             .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
@@ -369,6 +378,7 @@ impl arch::LinuxArch for Riscv64 {
             pci_irqs,
             pci_cfg,
             &pci_ranges,
+            dev_resources,
             components.vcpu_count as u32,
             fdt_offset,
             aia_num_ids,
@@ -376,6 +386,7 @@ impl arch::LinuxArch for Riscv64 {
             cmdline.as_str(),
             initrd,
             timebase_freq,
+            device_tree_overlays,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -448,6 +459,14 @@ impl arch::LinuxArch for Riscv64 {
 
     fn get_host_cpu_frequencies_khz() -> Result<BTreeMap<usize, Vec<u32>>> {
         Ok(BTreeMap::new())
+    }
+
+    fn get_host_cpu_capacity() -> Result<BTreeMap<usize, u32>> {
+        Ok(BTreeMap::new())
+    }
+
+    fn get_host_cpu_clusters() -> Result<Vec<CpuSet>> {
+        Ok(Vec::new())
     }
 }
 

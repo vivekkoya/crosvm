@@ -9,12 +9,12 @@ use std::ops::DerefMut;
 
 use base::AsRawDescriptor;
 use base::RawDescriptor;
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 use base::UnixSeqpacket;
 use remain::sorted;
 use thiserror::Error as ThisError;
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 #[sorted]
 #[derive(ThisError, Debug)]
 pub enum Error {
@@ -25,10 +25,10 @@ pub enum Error {
     Io(std::io::Error),
     /// An error with a polled(FD) source.
     #[error("An error with a poll source: {0}")]
-    Poll(crate::sys::unix::poll_source::Error),
+    Poll(crate::sys::linux::poll_source::Error),
     /// An error with a uring source.
     #[error("An error with a uring source: {0}")]
-    Uring(crate::sys::unix::uring_executor::Error),
+    Uring(crate::sys::linux::uring_executor::Error),
 }
 
 #[cfg(windows)]
@@ -49,21 +49,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[cfg(unix)]
-impl From<crate::sys::unix::uring_executor::Error> for Error {
-    fn from(err: crate::sys::unix::uring_executor::Error) -> Self {
+#[cfg(any(target_os = "android", target_os = "linux"))]
+impl From<crate::sys::linux::uring_executor::Error> for Error {
+    fn from(err: crate::sys::linux::uring_executor::Error) -> Self {
         Error::Uring(err)
     }
 }
 
-#[cfg(unix)]
-impl From<crate::sys::unix::poll_source::Error> for Error {
-    fn from(err: crate::sys::unix::poll_source::Error) -> Self {
+#[cfg(any(target_os = "android", target_os = "linux"))]
+impl From<crate::sys::linux::poll_source::Error> for Error {
+    fn from(err: crate::sys::linux::poll_source::Error) -> Self {
         Error::Poll(err)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
         use Error::*;
@@ -113,7 +113,7 @@ impl From<crate::sys::windows::handle_executor::Error> for Error {
 pub trait IntoAsync: AsRawDescriptor {}
 
 impl IntoAsync for File {}
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 impl IntoAsync for UnixSeqpacket {}
 
 /// Simple wrapper struct to implement IntoAsync on foreign types.

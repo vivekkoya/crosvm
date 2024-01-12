@@ -61,7 +61,7 @@ pub const DEFAULT_BUFFER_SIZE: usize = 50 * 1024;
 /// The ReadNotifier will return an event handle that is set when data is in the channel.
 ///
 /// In message mode, single writes larger than
-/// `crate::platform::named_pipes::DEFAULT_BUFFER_SIZE` are not permitted.
+/// `crate::windows::named_pipes::DEFAULT_BUFFER_SIZE` are not permitted.
 ///
 /// # Notes for maintainers
 /// 1. This struct contains extremely subtle thread safety considerations.
@@ -203,11 +203,10 @@ impl StreamChannel {
         // could stall readers.)
         let _read_lock = self.read_lock.lock();
 
-        let res = unsafe {
-            // Safe because no partial reads are possible, and the underlying code bounds the
-            // read by buf's size.
-            self.pipe_conn.read(buf)
-        };
+        // SAFETY:
+        // Safe because no partial reads are possible, and the underlying code bounds the
+        // read by buf's size.
+        let res = unsafe { self.pipe_conn.read(buf) };
 
         // The entire goal of this complex section is to avoid the need for shared memory between
         // each channel end to synchronize the notification state. It is very subtle, modify with

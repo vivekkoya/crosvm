@@ -29,7 +29,13 @@ use devices::virtio::vhost::user::gpu::sys::windows::product::GpuBackendConfig a
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::gpu::sys::windows::product::GpuVmmConfig as GpuVmmConfigProduct;
 #[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::gpu::sys::windows::product::WindowProcedureThreadVmmConfig as WindowProcedureThreadVmmConfigProduct;
+#[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::gpu::sys::windows::GpuVmmConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::gpu::sys::windows::InputEventVmmConfig;
+#[cfg(feature = "gpu")]
+use devices::virtio::vhost::user::gpu::sys::windows::WindowProcedureThreadVmmConfig;
 #[cfg(feature = "audio")]
 use devices::virtio::vhost::user::snd::sys::windows::product::SndBackendConfig as SndBackendConfigProduct;
 #[cfg(feature = "audio")]
@@ -42,6 +48,10 @@ use devices::virtio::DisplayBackend;
 use devices::virtio::Gpu;
 #[cfg(feature = "gpu")]
 use devices::virtio::GpuParameters;
+#[cfg(feature = "gpu")]
+use gpu_display::WindowProcedureThread;
+#[cfg(feature = "gpu")]
+use gpu_display::WindowProcedureThreadBuilder;
 pub(crate) use metrics::log_descriptor;
 pub(crate) use metrics::MetricEventType;
 use sync::Mutex;
@@ -55,7 +65,7 @@ use vm_control::VmRunMode;
 use super::run_vcpu::VcpuRunMode;
 use crate::crosvm::config::Config;
 use crate::crosvm::sys::cmdline::RunMetricsCommand;
-use crate::sys::platform::TaggedControlTube as SharedTaggedControlTube;
+use crate::sys::windows::TaggedControlTube as SharedTaggedControlTube;
 
 pub struct MessageFromService {}
 
@@ -206,20 +216,20 @@ pub(super) fn create_service_vm_state(_memory_size_mb: u64) -> ServiceVmState {
 #[cfg(feature = "gpu")]
 pub(super) fn create_gpu(
     vm_evt_wrtube: &SendTube,
+    gpu_control_tube: Tube,
     resource_bridges: Vec<Tube>,
     display_backends: Vec<DisplayBackend>,
     gpu_parameters: &GpuParameters,
     event_devices: Vec<EventDevice>,
     features: u64,
     _product_args: GpuBackendConfigProduct,
+    wndproc_thread: WindowProcedureThread,
 ) -> Result<Gpu> {
-    let wndproc_thread =
-        virtio::gpu::start_wndproc_thread().expect("Failed to start wndproc_thread!");
-
     Ok(Gpu::new(
         vm_evt_wrtube
             .try_clone()
             .exit_context(Exit::CloneTube, "failed to clone tube")?,
+        gpu_control_tube,
         resource_bridges,
         display_backends,
         gpu_parameters,
@@ -229,6 +239,15 @@ pub(super) fn create_gpu(
         &BTreeMap::new(),
         wndproc_thread,
     ))
+}
+
+#[cfg(feature = "gpu")]
+pub(super) fn push_window_procedure_thread_control_tubes(
+    #[allow(clippy::ptr_arg)]
+    // The implementor can extend the size of this argument, so mutable slice is not enough.
+    _control_tubes: &mut Vec<SharedTaggedControlTube>,
+    _: &mut WindowProcedureThreadVmmConfig,
+) {
 }
 
 #[cfg(feature = "gpu")]
@@ -286,7 +305,7 @@ pub(crate) fn setup_metrics_reporting() -> Result<()> {
 
 pub(super) fn push_mouse_device(
     cfg: &Config,
-    #[cfg(feature = "gpu")] _gpu_vmm_config: &mut GpuVmmConfig,
+    #[cfg(feature = "gpu")] _input_event_vmm_config: &mut InputEventVmmConfig,
     _devs: &mut [VirtioDeviceStub],
 ) -> Result<()> {
     Ok(())
@@ -298,4 +317,14 @@ pub(super) fn push_pvclock_device(
     tsc_frequency: u64,
     tube: Tube,
 ) {
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn get_window_procedure_thread_product_configs(
+    _: &Config,
+    _: &mut WindowProcedureThreadBuilder,
+    _main_alias_pid: u32,
+    _device_alias_pid: u32,
+) -> Result<WindowProcedureThreadVmmConfigProduct> {
+    Ok(WindowProcedureThreadVmmConfigProduct {})
 }

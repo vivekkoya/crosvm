@@ -14,10 +14,11 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::super::net::UnixSeqpacket;
-use super::super::Result;
-use super::RawDescriptor;
 use crate::descriptor::AsRawDescriptor;
+use crate::IntoRawDescriptor;
+use crate::RawDescriptor;
 use crate::ReadNotifier;
+use crate::Result;
 
 #[derive(Copy, Clone)]
 pub enum FramingMode {
@@ -52,7 +53,7 @@ impl AsRawDescriptor for StreamChannel {
 #[derive(Debug, Deserialize, Serialize)]
 enum SocketType {
     Message(UnixSeqpacket),
-    #[serde(with = "super::with_as_descriptor")]
+    #[serde(with = "crate::with_as_descriptor")]
     Byte(UnixStream),
 }
 
@@ -90,6 +91,7 @@ impl StreamChannel {
             // (see sys::decode_error_kind) on Windows, so we preserve this behavior on POSIX even
             // though one could argue ErrorKind::UnexpectedEof is a closer match to the true error.
             SocketType::Message(sock) => {
+                // SAFETY:
                 // Safe because buf is valid, we pass buf's size to recv to bound the return
                 // length, and we check the return code.
                 let retval = unsafe {
@@ -239,6 +241,15 @@ impl AsRawDescriptor for &StreamChannel {
         match &self.stream {
             SocketType::Byte(sock) => sock.as_raw_descriptor(),
             SocketType::Message(sock) => sock.as_raw_descriptor(),
+        }
+    }
+}
+
+impl IntoRawDescriptor for StreamChannel {
+    fn into_raw_descriptor(self) -> RawFd {
+        match self.stream {
+            SocketType::Byte(sock) => sock.into_raw_descriptor(),
+            SocketType::Message(sock) => sock.into_raw_descriptor(),
         }
     }
 }

@@ -5,7 +5,6 @@
 //! Crate for displaying simple surfaces and GPU buffers over wayland.
 
 extern crate base;
-extern crate data_model;
 
 #[path = "dwl.rs"]
 mod dwl;
@@ -27,7 +26,7 @@ use base::MemoryMapping;
 use base::MemoryMappingBuilder;
 use base::RawDescriptor;
 use base::SharedMemory;
-use data_model::VolatileMemory;
+use base::VolatileMemory;
 use dwl::*;
 use linux_input_sys::virtio_input_event;
 
@@ -49,6 +48,7 @@ struct DwlContext(*mut dwl_context);
 impl Drop for DwlContext {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY:
             // Safe given that we checked the pointer for non-null and it should always be of the
             // correct type.
             unsafe {
@@ -60,6 +60,7 @@ impl Drop for DwlContext {
 
 impl AsRawDescriptor for DwlContext {
     fn as_raw_descriptor(&self) -> RawDescriptor {
+        // SAFETY:
         // Safe given that the context pointer is valid.
         unsafe { dwl_context_fd(self.0) }
     }
@@ -72,6 +73,7 @@ impl GpuDisplayImport for DwlDmabuf {}
 impl Drop for DwlDmabuf {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY:
             // Safe given that we checked the pointer for non-null and it should always be of the
             // correct type.
             unsafe {
@@ -85,6 +87,7 @@ struct DwlSurface(*mut dwl_surface);
 impl Drop for DwlSurface {
     fn drop(&mut self) {
         if !self.0.is_null() {
+            // SAFETY:
             // Safe given that we checked the pointer for non-null and it should always be of the
             // correct type.
             unsafe {
@@ -110,6 +113,7 @@ impl WaylandSurface {
 
 impl GpuDisplaySurface for WaylandSurface {
     fn surface_descriptor(&self) -> u64 {
+        // SAFETY:
         // Safe if the surface is valid.
         let pointer = unsafe { dwl_surface_descriptor(self.surface.0) };
         pointer as u64
@@ -131,11 +135,13 @@ impl GpuDisplaySurface for WaylandSurface {
 
     fn next_buffer_in_use(&self) -> bool {
         let next_buffer_index = (self.buffer_index.get() + 1) % BUFFER_COUNT;
+        // SAFETY:
         // Safe because only a valid surface and buffer index is used.
         unsafe { dwl_surface_buffer_in_use(self.surface(), next_buffer_index) }
     }
 
     fn close_requested(&self) -> bool {
+        // SAFETY:
         // Safe because only a valid surface is used.
         unsafe { dwl_surface_close_requested(self.surface()) }
     }
@@ -144,6 +150,7 @@ impl GpuDisplaySurface for WaylandSurface {
         self.buffer_index
             .set((self.buffer_index.get() + 1) % BUFFER_COUNT);
 
+        // SAFETY:
         // Safe because only a valid surface and buffer index is used.
         unsafe {
             dwl_surface_flip(self.surface(), self.buffer_index.get());
@@ -151,11 +158,13 @@ impl GpuDisplaySurface for WaylandSurface {
     }
 
     fn flip_to(&mut self, import_id: u32) {
+        // SAFETY:
         // Safe because only a valid surface and import_id is used.
         unsafe { dwl_surface_flip_to(self.surface(), import_id) }
     }
 
     fn commit(&mut self) -> GpuDisplayResult<()> {
+        // SAFETY:
         // Safe because only a valid surface is used.
         unsafe {
             dwl_surface_commit(self.surface());
@@ -165,6 +174,7 @@ impl GpuDisplaySurface for WaylandSurface {
     }
 
     fn set_position(&mut self, x: u32, y: u32) {
+        // SAFETY:
         // Safe because only a valid surface is used.
         unsafe {
             dwl_surface_set_position(self.surface(), x, y);
@@ -172,6 +182,7 @@ impl GpuDisplaySurface for WaylandSurface {
     }
 
     fn set_scanout_id(&mut self, scanout_id: u32) {
+        // SAFETY:
         // Safe because only a valid surface is used.
         unsafe {
             dwl_surface_set_scanout_id(self.surface(), scanout_id);
@@ -192,10 +203,13 @@ pub struct DisplayWl {
 
 /// Error logging callback used by wrapped C implementation.
 ///
+/// # Safety
+///
 /// safe because it must be passed a valid pointer to null-terminated c-string.
 unsafe extern "C" fn error_callback(message: *const ::std::os::raw::c_char) {
     catch_unwind(|| {
         assert!(!message.is_null());
+        // SAFETY: trivially safe
         let msg = unsafe {
             std::str::from_utf8(std::slice::from_raw_parts(
                 message as *const u8,
@@ -211,6 +225,7 @@ unsafe extern "C" fn error_callback(message: *const ::std::os::raw::c_char) {
 impl DisplayWl {
     /// Opens a fresh connection to the compositor.
     pub fn new(wayland_path: Option<&Path>) -> GpuDisplayResult<DisplayWl> {
+        // SAFETY:
         // The dwl_context_new call should always be safe to call, and we check its result.
         let ctx = DwlContext(unsafe { dwl_context_new(Some(error_callback)) });
         if ctx.0.is_null() {
@@ -234,6 +249,7 @@ impl DisplayWl {
             .as_ref()
             .map(|s: &CString| CStr::as_ptr(s))
             .unwrap_or(null());
+        // SAFETY: args are valid and the return value is checked.
         let setup_success = unsafe { dwl_context_setup(ctx.0, cstr_path_ptr) };
         if !setup_success {
             return Err(GpuDisplayError::Connect);
@@ -251,6 +267,7 @@ impl DisplayWl {
     }
 
     fn pop_event(&self) -> dwl_event {
+        // SAFETY:
         // Safe because dwl_next_events from a context's circular buffer.
         unsafe {
             let mut ev = zeroed();
@@ -272,6 +289,7 @@ impl DisplayWl {
 
 impl DisplayT for DisplayWl {
     fn pending_events(&self) -> bool {
+        // SAFETY:
         // Safe because the function just queries the values of two variables in a context.
         unsafe { dwl_context_pending_events(self.ctx()) }
     }
@@ -296,7 +314,7 @@ impl DisplayT for DisplayWl {
             DWL_EVENT_TYPE_KEYBOARD_KEY => {
                 let linux_keycode = event.params[0] as u16;
                 let pressed = event.params[1] == DWL_KEYBOARD_KEY_STATE_PRESSED;
-                let events = vec![virtio_input_event::key(linux_keycode, pressed)];
+                let events = vec![virtio_input_event::key(linux_keycode, pressed, false)];
                 Some(GpuDisplayEvents {
                     events,
                     device_type: EventDeviceKind::Keyboard,
@@ -341,6 +359,7 @@ impl DisplayT for DisplayWl {
     }
 
     fn flush(&self) {
+        // SAFETY:
         // Safe given that the context pointer is valid.
         unsafe {
             dwl_context_dispatch(self.ctx());
@@ -370,6 +389,7 @@ impl DisplayT for DisplayWl {
             SurfaceType::Cursor => DWL_SURFACE_FLAG_HAS_ALPHA,
             SurfaceType::Scanout => DWL_SURFACE_FLAG_RECEIVE_INPUT,
         };
+        // SAFETY:
         // Safe because only a valid context, parent ID (if not non-zero), and buffer FD are used.
         // The returned surface is checked for validity before being filed away.
         let surface = DwlSurface(unsafe {
@@ -411,6 +431,7 @@ impl DisplayT for DisplayWl {
         height: u32,
         fourcc: u32,
     ) -> GpuDisplayResult<Box<dyn GpuDisplayImport>> {
+        // SAFETY:
         // Safe given that the context pointer is valid. Any other invalid parameters would be
         // rejected by dwl_context_dmabuf_new safely. We check that the resulting dmabuf is valid
         // before filing it away.

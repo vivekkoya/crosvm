@@ -2,14 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::io;
-use std::io::Read;
-use std::io::Write;
-
-use libc::c_int;
-use libc::c_uint;
 use libc::c_void;
-use remain::sorted;
 use win_util::create_file_mapping;
 use win_util::duplicate_handle;
 use winapi::um::winnt::PAGE_READWRITE;
@@ -21,50 +14,11 @@ use crate::FromRawDescriptor;
 use crate::MappedRegion;
 use crate::MemoryMapping as CrateMemoryMapping;
 use crate::MemoryMappingBuilder;
+use crate::MmapError as Error;
+use crate::MmapResult as Result;
 use crate::Protection;
 use crate::RawDescriptor;
 use crate::SafeDescriptor;
-
-#[sorted]
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("`add_fd_mapping` is unsupported")]
-    AddFdMappingIsUnsupported,
-    #[error("requested memory out of range")]
-    InvalidAddress,
-    #[error("invalid argument provided when creating mapping")]
-    InvalidArgument,
-    #[error("requested offset is out of range of off_t")]
-    InvalidOffset,
-    #[error("requested memory range spans past the end of the region: offset={0} count={1} region_size={2}")]
-    InvalidRange(usize, usize, usize),
-    #[error("requested memory is not page aligned")]
-    NotPageAligned,
-    #[error("failed to read from file to memory: {0}")]
-    ReadToMemory(#[source] io::Error),
-    #[error("`remove_mapping` is unsupported")]
-    RemoveMappingIsUnsupported,
-    #[error("system call failed while creating the mapping: {0}")]
-    StdSyscallFailed(io::Error),
-    #[error("mmap related system call failed: {0}")]
-    SystemCallFailed(#[source] super::Error),
-    #[error("failed to write from memory to file: {0}")]
-    WriteFromMemory(#[source] io::Error),
-}
-pub type Result<T> = std::result::Result<T, Error>;
-
-impl From<c_uint> for Protection {
-    fn from(f: c_uint) -> Self {
-        Protection::from(f as c_int)
-    }
-}
-
-impl From<Protection> for c_uint {
-    fn from(p: Protection) -> c_uint {
-        let i: c_int = p.into();
-        i as c_uint
-    }
-}
 
 /// Validates that `offset`..`offset+range_size` lies within the bounds of a memory mapping of
 /// `mmap_size` bytes.  Also checks for any overflow.
@@ -87,6 +41,7 @@ impl dyn MappedRegion {
     pub fn msync(&self, offset: usize, size: usize) -> Result<()> {
         validate_includes_range(self.size(), offset, size)?;
 
+        // SAFETY:
         // Safe because the MemoryMapping/MemoryMappingArena interface ensures our pointer and size
         // are correct, and we've validated that `offset`..`offset+size` is in the range owned by
         // this `MappedRegion`.
@@ -114,11 +69,13 @@ pub struct MemoryMapping {
     pub(crate) size: usize,
 }
 
+// SAFETY:
 // Send and Sync aren't automatically inherited for the raw address pointer.
 // Accessing that pointer is only done through the stateless interface which
 // allows the object to be shared by multiple threads without a decrease in
 // safety.
 unsafe impl Send for MemoryMapping {}
+// SAFETY: See comments for impl Send
 unsafe impl Sync for MemoryMapping {}
 
 impl MemoryMapping {
@@ -169,6 +126,9 @@ impl MemoryMapping {
     }
 }
 
+// SAFETY:
+// Safe because the pointer and size point to a memory range owned by this MemoryMapping that won't
+// be unmapped until it's Dropped.
 unsafe impl MappedRegion for MemoryMapping {
     fn as_ptr(&self) -> *mut u8 {
         self.addr as *mut u8
@@ -180,24 +140,6 @@ unsafe impl MappedRegion for MemoryMapping {
 }
 
 impl CrateMemoryMapping {
-    pub fn read_to_memory<F: Read>(
-        &self,
-        mem_offset: usize,
-        src: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        self.mapping.read_to_memory(mem_offset, src, count)
-    }
-
-    pub fn write_from_memory<F: Write>(
-        &self,
-        mem_offset: usize,
-        dst: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        self.mapping.write_from_memory(mem_offset, dst, count)
-    }
-
     pub fn from_raw_ptr(addr: RawDescriptor, size: usize) -> Result<CrateMemoryMapping> {
         MemoryMapping::from_raw_ptr(addr, size).map(|mapping| CrateMemoryMapping {
             mapping,
@@ -235,6 +177,7 @@ impl<'a> MemoryMappingBuilder<'a> {
                     // handle for it first. That handle is then provided to Self::wrap, which
                     // performs the actual mmap (creating a mapped view).
                     //
+                    // SAFETY:
                     // Safe because self.descriptor is guaranteed to be a valid handle.
                     let mapping_handle = unsafe {
                         create_file_mapping(
@@ -246,6 +189,7 @@ impl<'a> MemoryMappingBuilder<'a> {
                     }
                     .map_err(Error::StdSyscallFailed)?;
 
+                    // SAFETY:
                     // The above comment block is why the SafeDescriptor wrap is safe.
                     Some(unsafe { SafeDescriptor::from_raw_descriptor(mapping_handle) })
                 } else {
@@ -283,6 +227,7 @@ impl<'a> MemoryMappingBuilder<'a> {
         file_descriptor: Option<&'a dyn AsRawDescriptor>,
     ) -> Result<CrateMemoryMapping> {
         let file_descriptor = match file_descriptor {
+            // SAFETY:
             // Safe because `duplicate_handle` will return a handle or at least error out.
             Some(descriptor) => unsafe {
                 Some(SafeDescriptor::from_raw_descriptor(
@@ -302,13 +247,10 @@ impl<'a> MemoryMappingBuilder<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
-
-    use data_model::VolatileMemory;
-    use data_model::VolatileMemoryError;
-
-    use super::super::shm::SharedMemory;
     use super::*;
+    use crate::SharedMemory;
+    use crate::VolatileMemory;
+    use crate::VolatileMemoryError;
 
     // get_slice() and other methods are only available on crate::MemoryMapping.
     fn to_crate_mmap(mapping: MemoryMapping) -> crate::MemoryMapping {
@@ -320,14 +262,14 @@ mod tests {
 
     #[test]
     fn basic_map() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 1024).unwrap());
         assert_eq!(1024, m.size());
     }
 
     #[test]
     fn test_write_past_end() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 5).unwrap());
         let res = m.write_slice(&[1, 2, 3, 4, 5, 6], 0);
         assert!(res.is_ok());
@@ -336,7 +278,7 @@ mod tests {
 
     #[test]
     fn slice_size() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 5).unwrap());
         let s = m.get_slice(2, 3).unwrap();
         assert_eq!(s.size(), 3);
@@ -344,15 +286,16 @@ mod tests {
 
     #[test]
     fn slice_addr() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 5).unwrap());
         let s = m.get_slice(2, 3).unwrap();
+        // SAFETY: trivially safe
         assert_eq!(s.as_ptr(), unsafe { m.as_ptr().offset(2) });
     }
 
     #[test]
     fn slice_overflow_error() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 5).unwrap());
         let res = m.get_slice(std::usize::MAX, 3).unwrap_err();
         assert_eq!(
@@ -365,7 +308,7 @@ mod tests {
     }
     #[test]
     fn slice_oob_error() {
-        let shm = SharedMemory::new(&CString::new("test").unwrap(), 1028).unwrap();
+        let shm = SharedMemory::new("test", 1028).unwrap();
         let m = to_crate_mmap(MemoryMapping::from_descriptor(&shm, 5).unwrap());
         let res = m.get_slice(3, 3).unwrap_err();
         assert_eq!(res, VolatileMemoryError::OutOfBounds { addr: 6 });

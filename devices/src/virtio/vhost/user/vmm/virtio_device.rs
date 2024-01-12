@@ -22,6 +22,7 @@ use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
 
 use crate::pci::MsixConfig;
 use crate::virtio::copy_config;
+use crate::virtio::device_constants::VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK;
 use crate::virtio::vhost::user::vmm::Connection;
 use crate::virtio::vhost::user::vmm::Result;
 use crate::virtio::vhost::user::vmm::VhostUserHandler;
@@ -32,6 +33,7 @@ use crate::virtio::QueueConfig;
 use crate::virtio::SharedMemoryMapper;
 use crate::virtio::SharedMemoryRegion;
 use crate::virtio::VirtioDevice;
+use crate::PciAddress;
 
 pub struct VhostUserVirtioDevice {
     device_type: DeviceType,
@@ -40,6 +42,7 @@ pub struct VhostUserVirtioDevice {
     queue_sizes: Vec<u16>,
     cfg: Option<Vec<u8>>,
     expose_shmem_descriptors_with_viommu: bool,
+    pci_address: Option<PciAddress>,
 }
 
 // Returns the largest power of two that is less than or equal to `val`.
@@ -59,34 +62,71 @@ impl VhostUserVirtioDevice {
     ///
     /// # Arguments
     ///
+    /// - `device_type`: virtio device type
+    /// - `base_features`: base virtio device features (e.g. `VIRTIO_F_VERSION_1`)
+    /// - `connection`: connection to the device backend
+    /// - `max_queue_size`: maximum number of entries in each queue (default: [`Queue::MAX_SIZE`])
+    pub fn new(
+        device_type: DeviceType,
+        base_features: u64,
+        connection: Connection,
+        max_queue_size: Option<u16>,
+        pci_address: Option<PciAddress>,
+    ) -> Result<VhostUserVirtioDevice> {
+        VhostUserVirtioDevice::new_internal(
+            connection,
+            device_type,
+            max_queue_size,
+            base_features,
+            None, // cfg
+            pci_address,
+        )
+    }
+
+    /// Create a new VirtioDevice for a vhost-user device frontend.
+    ///
+    /// # Arguments
+    ///
     /// - `connection`: connection to the device backend
     /// - `device_type`: virtio device type
-    /// - `default_queues`: number of queues if the backend does not support the MQ feature
     /// - `max_queue_size`: maximum number of entries in each queue (default: [`Queue::MAX_SIZE`])
-    /// - `allow_features`: allowed virtio device features
-    /// - `allow_protocol_features`: allowed vhost-user protocol features
     /// - `base_features`: base virtio device features (e.g. `VIRTIO_F_VERSION_1`)
     /// - `cfg`: bytes to return for the virtio configuration space (queried from device if not
     ///   specified)
-    pub fn new(
+    pub(crate) fn new_internal(
         connection: Connection,
         device_type: DeviceType,
-        default_queues: usize,
         max_queue_size: Option<u16>,
-        allow_features: u64,
-        allow_protocol_features: VhostUserProtocolFeatures,
         base_features: u64,
         cfg: Option<&[u8]>,
-        expose_shmem_descriptors_with_viommu: bool,
+        pci_address: Option<PciAddress>,
     ) -> Result<VhostUserVirtioDevice> {
-        let allow_features = allow_features | base_features | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
+        let allow_features = VIRTIO_DEVICE_TYPE_SPECIFIC_FEATURES_MASK
+            | base_features
+            | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
+
+        let mut allow_protocol_features = VhostUserProtocolFeatures::CONFIG
+            | VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::SLAVE_REQ;
+
+        // HACK: the crosvm vhost-user GPU backend supports the non-standard
+        // VHOST_USER_PROTOCOL_FEATURE_SHARED_MEMORY_REGIONS. This should either be standardized
+        // (and enabled for all device types) or removed.
+        let expose_shmem_descriptors_with_viommu = if device_type == DeviceType::Gpu {
+            allow_protocol_features |= VhostUserProtocolFeatures::SHARED_MEMORY_REGIONS;
+            true
+        } else {
+            false
+        };
 
         let handler = VhostUserHandler::new(connection, allow_features, allow_protocol_features)?;
 
         // If the device supports VHOST_USER_PROTOCOL_F_MQ, use VHOST_USER_GET_QUEUE_NUM to
-        // determine the number of queues supported. Otherwise, use the `default_queues` value
-        // provided by the frontend.
-        let num_queues = handler.num_queues()?.unwrap_or(default_queues);
+        // determine the number of queues supported. Otherwise, use the minimum number of queues
+        // required by the spec for this device type.
+        let num_queues = handler
+            .num_queues()?
+            .unwrap_or_else(|| device_type.min_queues());
 
         // Clamp the maximum queue size to the largest power of 2 <= max_queue_size.
         let max_queue_size = max_queue_size
@@ -94,7 +134,13 @@ impl VhostUserVirtioDevice {
             .unwrap_or(Queue::MAX_SIZE);
 
         trace!(
-            "vhost-user {device_type} frontend with {num_queues} queues x {max_queue_size} entries"
+            "vhost-user {device_type} frontend with {num_queues} queues x {max_queue_size} entries\
+            {}",
+            if let Some(pci_address) = pci_address {
+                format!(" pci-address {pci_address}")
+            } else {
+                "".to_string()
+            }
         );
 
         let queue_sizes = vec![max_queue_size; num_queues];
@@ -106,6 +152,7 @@ impl VhostUserVirtioDevice {
             queue_sizes,
             cfg: cfg.map(|cfg| cfg.to_vec()),
             expose_shmem_descriptors_with_viommu,
+            pci_address,
         })
     }
 }
@@ -171,6 +218,10 @@ impl VirtioDevice for VhostUserVirtioDevice {
         }
     }
 
+    fn pci_address(&self) -> Option<PciAddress> {
+        self.pci_address
+    }
+
     fn get_shared_memory_region(&self) -> Option<SharedMemoryRegion> {
         match self.handler.borrow_mut().get_shared_memory_region() {
             Ok(r) => r,
@@ -214,7 +265,7 @@ impl VirtioDevice for VhostUserVirtioDevice {
             .context("Failed to wake device.")
     }
 
-    fn virtio_snapshot(&self) -> anyhow::Result<Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<Value> {
         self.handler
             .borrow_mut()
             .snapshot()

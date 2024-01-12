@@ -36,6 +36,7 @@ use thiserror::Error;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use self::event_source::EvdevEventSource;
 use self::event_source::EventSource;
@@ -94,7 +95,7 @@ pub enum InputError {
 
 pub type Result<T> = std::result::Result<T, InputError>;
 
-#[derive(Copy, Clone, Default, Debug, AsBytes, FromBytes, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Debug, AsBytes, FromZeroes, FromBytes, Serialize, Deserialize)]
 #[repr(C)]
 pub struct virtio_input_device_ids {
     bustype: Le16,
@@ -114,7 +115,7 @@ impl virtio_input_device_ids {
     }
 }
 
-#[derive(Copy, Clone, Default, Debug, AsBytes, FromBytes, Serialize, Deserialize)]
+#[derive(Copy, Clone, Default, Debug, AsBytes, FromZeroes, FromBytes, Serialize, Deserialize)]
 #[repr(C)]
 pub struct virtio_input_absinfo {
     min: Le32,
@@ -134,7 +135,7 @@ impl virtio_input_absinfo {
     }
 }
 
-#[derive(Copy, Clone, AsBytes, FromBytes)]
+#[derive(Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 #[repr(C)]
 struct virtio_input_config {
     select: u8,
@@ -633,7 +634,7 @@ where
         Ok(())
     }
 
-    fn virtio_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(InputSnapshot {
             virtio_features: self.virtio_features,
             config: self.config.clone(),

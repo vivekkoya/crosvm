@@ -16,6 +16,7 @@ use base::Tube;
 use devices::Bus;
 use devices::BusAccessInfo;
 use devices::BusDeviceSync;
+use devices::BusType;
 use devices::CrosvmDeviceId;
 use devices::DestinationShorthand;
 use devices::DeviceId;
@@ -203,8 +204,8 @@ fn irq_event_tokens() {
 fn finalize_devices() {
     let mut chip = get_chip(1);
 
-    let mmio_bus = Bus::new();
-    let io_bus = Bus::new();
+    let mmio_bus = Bus::new(BusType::Mmio);
+    let io_bus = Bus::new(BusType::Io);
     let mut resources = SystemAllocator::new(
         SystemAllocatorConfig {
             io: Some(AddressRange {
@@ -459,8 +460,8 @@ fn lowest_priority_destination() {
 fn broadcast_eoi() {
     let mut chip = get_chip(1);
 
-    let mmio_bus = Bus::new();
-    let io_bus = Bus::new();
+    let mmio_bus = Bus::new(BusType::Mmio);
+    let io_bus = Bus::new(BusType::Io);
     let mut resources = SystemAllocator::new(
         SystemAllocatorConfig {
             io: Some(AddressRange {
@@ -669,7 +670,7 @@ impl Vcpu for FakeVcpu {
 
     fn set_immediate_exit(&self, _exit: bool) {}
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn signal_handle(&self) -> hypervisor::VcpuSignalHandle {
         unimplemented!()
     }
@@ -784,10 +785,20 @@ impl VcpuX86_64 for FakeVcpu {
     fn set_tsc_offset(&self, _offset: u64) -> Result<()> {
         unimplemented!()
     }
+    fn set_tsc_value(&self, _value: u64) -> Result<()> {
+        unimplemented!()
+    }
     fn snapshot(&self) -> anyhow::Result<VcpuSnapshot> {
         unimplemented!()
     }
-    fn restore(&mut self, _snapshot: &VcpuSnapshot) -> anyhow::Result<()> {
+    fn restore(
+        &mut self,
+        _snapshot: &VcpuSnapshot,
+        _host_tsc_reference_moment: u64,
+    ) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    fn restore_timekeeping(&self, _host_tsc_reference_moment: u64, _tsc_offset: u64) -> Result<()> {
         unimplemented!()
     }
 }

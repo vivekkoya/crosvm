@@ -2,9 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+mod keyboard_input_manager;
 mod math_util;
+mod mouse_input_manager;
 pub mod surface;
+mod virtual_display_manager;
 mod window;
+mod window_manager;
 mod window_message_dispatcher;
 mod window_message_processor;
 pub mod window_procedure_thread;
@@ -28,12 +32,13 @@ use euclid::size2;
 use euclid::Size2D;
 use math_util::Size2DCheckedCast;
 use metrics::sys::windows::Metrics;
-pub use surface::NoopSurface as Surface;
+pub use surface::Surface;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_control::ModifyWaitContext;
 use window_message_processor::DisplaySendToWndProc;
 pub use window_procedure_thread::WindowProcedureThread;
+pub use window_procedure_thread::WindowProcedureThreadBuilder;
 
 use crate::DisplayT;
 use crate::EventDevice;
@@ -71,7 +76,7 @@ impl From<&DisplayParameters> for DisplayProperties {
 }
 
 pub struct DisplayWin {
-    wndproc_thread: WindowProcedureThread<Surface>,
+    wndproc_thread: WindowProcedureThread,
     display_closed_event: Event,
     win_metrics: Option<Weak<Metrics>>,
     display_properties: DisplayProperties,
@@ -83,7 +88,7 @@ pub struct DisplayWin {
 
 impl DisplayWin {
     pub fn new(
-        wndproc_thread: WindowProcedureThread<Surface>,
+        wndproc_thread: WindowProcedureThread,
         win_metrics: Option<Weak<Metrics>>,
         display_properties: DisplayProperties,
         gpu_display_wait_descriptor_ctrl: SendTube,
@@ -307,5 +312,36 @@ impl GpuDisplaySurface for SurfaceWin {
                 false
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base::Tube;
+
+    use super::*;
+
+    #[test]
+    fn can_create_2_window_proc_threads() {
+        let threads = (0..2)
+            .map(|_| {
+                let (main_ime_tube, _device_ime_tube) =
+                    Tube::pair().expect("failed to create IME tube");
+                let wndproc_thread_builder = WindowProcedureThread::builder();
+                #[cfg(feature = "kiwi")]
+                let wndproc_thread_builder = {
+                    let mut wndproc_thread_builder = wndproc_thread_builder;
+                    wndproc_thread_builder
+                        .set_display_tube(None)
+                        .set_ime_tube(Some(_device_ime_tube));
+                    wndproc_thread_builder
+                };
+                (
+                    wndproc_thread_builder.start_thread().unwrap(),
+                    main_ime_tube,
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(threads);
     }
 }

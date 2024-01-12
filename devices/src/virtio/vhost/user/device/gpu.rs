@@ -171,7 +171,7 @@ impl VhostUserBackend for GpuBackend {
         let queue = Arc::new(Mutex::new(queue));
         let reader = SharedReader {
             queue: queue.clone(),
-            doorbell,
+            doorbell: doorbell.clone(),
         };
 
         let state = if let Some(s) = self.state.as_ref() {
@@ -200,7 +200,7 @@ impl VhostUserBackend for GpuBackend {
         };
 
         // Start handling platform-specific workers.
-        self.start_platform_workers()?;
+        self.start_platform_workers(doorbell)?;
 
         // Start handling the control queue.
         let queue_task = self
@@ -256,11 +256,14 @@ impl VhostUserBackend for GpuBackend {
         self.gpu.borrow().get_shared_memory_region()
     }
 
-    fn set_backend_req_connection(&mut self, mut conn: VhostBackendReqConnection) {
-        let mut opt = self.shmem_mapper.lock();
-
-        if opt.replace(conn.take_shmem_mapper().unwrap()).is_some() {
-            warn!("connection already established. overwriting");
+    fn set_backend_req_connection(&mut self, conn: Arc<VhostBackendReqConnection>) {
+        if self
+            .shmem_mapper
+            .lock()
+            .replace(conn.take_shmem_mapper().unwrap())
+            .is_some()
+        {
+            warn!("Connection already established. Overwriting shmem_mapper");
         }
     }
 

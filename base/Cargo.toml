@@ -12,7 +12,6 @@ path = "tests/process.rs"
 harness = false
 
 [features]
-chromeos = []
 proto_tube = ["protobuf"]
 seccomp_trace = []
 
@@ -36,13 +35,13 @@ smallvec = "1.6.1"
 tempfile = "3"
 thiserror = "1.0.20"
 uuid = { version = "1", features = ["v4"] }
-zerocopy = "0.6"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 [dev-dependencies]
 libtest-mimic = "0.6"
 protos = { path = "../protos", features = ["composite-disk"] }
 
-[target.'cfg(unix)'.dependencies]
+[target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 minijail = "*"
 
 [target.'cfg(windows)'.dependencies]

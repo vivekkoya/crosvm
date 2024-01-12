@@ -2,18 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-mod block;
-mod console;
 mod fs;
-mod gpu;
 mod handler;
-mod mac80211_hwsim;
-mod net;
-mod snd;
-mod video;
 mod virtio_device;
-mod vsock;
-mod wl;
 
 use remain::sorted;
 use thiserror::Error as ThisError;
@@ -25,7 +16,7 @@ use vmm_vhost::Error as VhostError;
 pub use self::handler::VhostUserHandler;
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
         pub type Connection = std::os::unix::net::UnixStream;
     } else if #[cfg(windows)] {
         pub type Connection = base::Tube;

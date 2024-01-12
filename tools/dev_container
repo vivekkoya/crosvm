@@ -35,6 +35,8 @@ from impl.util import (
     is_cros_repo,
     is_kiwi_repo,
     kiwi_repo_root,
+    is_aosp_repo,
+    aosp_repo_root,
 )
 from impl.command import (
     chdir,
@@ -67,11 +69,9 @@ COMMON_ARGS = [
     # Use tmpfs in the container for faster performance.
     "--mount type=tmpfs,destination=/tmp",
     # KVM is required to run a VM for testing.
-    "--device /dev/kvm",
+    "--device /dev/kvm" if Path("/dev/kvm").is_char_device() else None,
     # Enable terminal colors
     f"--env TERM={os.environ.get('TERM', 'xterm-256color')}",
-    # Pass through NEXTEST_PROFILE for use by run_tests.
-    f"--env NEXTEST_PROFILE",
 ]
 
 DOCKER_ARGS = [
@@ -81,10 +81,20 @@ DOCKER_ARGS = [
 PODMAN_ARGS = [
     *COMMON_ARGS,
     # Allow access to group permissions of the user (e.g. for kvm access).
-    "--group-add keep-groups",
+    "--group-add keep-groups" if os.name == "posix" else None,
     # Increase number of PIDs the container can spawn (we run a lot of test processes in parallel)
-    "--pids-limit=4096",
+    "--pids-limit=4096" if os.name == "posix" else None,
 ]
+
+# Environment variables to pass through to the container if they are specified.
+ENV_PASSTHROUGH = [
+    "NEXTEST_PROFILE",
+]
+
+
+def machine_is_running(docker: cmd):
+    machine_state = docker("machine info").stdout()
+    return "MachineState: Running" in machine_state
 
 
 def container_name(cros: bool):
@@ -140,6 +150,11 @@ def workspace_mount_args(cros: bool):
             f"--volume {quoted(kiwi_repo_root())}/scratch:/scratch/cargo_target:rw",
             "--workdir /workspace/platform/crosvm",
         ]
+    elif is_aosp_repo():
+        return [
+            f"--volume {quoted(aosp_repo_root())}:/workspace:rw",
+            "--workdir /workspace/external/crosvm",
+        ]
     else:
         return [
             f"--volume {quoted(CROSVM_ROOT)}:/workspace:rw",
@@ -183,17 +198,18 @@ def validate_podman(podman: cmd):
                 print("[storage]", file=config_file)
                 print('driver = "overlay"', file=config_file)
 
-    username = os.environ["USER"]
-    subuids = Path("/etc/subuid").read_text()
-    if not username in subuids:
-        print("Rootless podman requires subuid's to be set up for your user.")
-        usermod = cmd(
-            "sudo usermod --add-subuids 900000-965535 --add-subgids 900000-965535", username
-        )
-        print("I can fix that by running:", usermod)
-        if confirm("Ok?"):
-            usermod.fg()
-            podman("system migrate").fg()
+    if os.name == "posix":
+        username = os.environ["USER"]
+        subuids = Path("/etc/subuid").read_text()
+        if not username in subuids:
+            print("Rootless podman requires subuid's to be set up for your user.")
+            usermod = cmd(
+                "sudo usermod --add-subuids 900000-965535 --add-subgids 900000-965535", username
+            )
+            print("I can fix that by running:", usermod)
+            if confirm("Ok?"):
+                usermod.fg()
+                podman("system migrate").fg()
 
 
 def main(argv: List[str]):
@@ -242,6 +258,12 @@ def main(argv: List[str]):
         ]
     else:
         docker = cmd("podman")
+
+        # On windows, podman uses wsl vm. start the default podman vm for the rest of the script
+        # to work properly.
+        if os.name == "nt" and not machine_is_running(docker):
+            print("Starting podman default machine.")
+            docker("machine start").fg(quiet=True)
         docker_args = [
             *PODMAN_ARGS,
             *workspace_mount_args(args.cros),
@@ -253,6 +275,14 @@ def main(argv: List[str]):
         docker_args.append(CROS_IMAGE_NAME)
     else:
         docker_args.append(DEV_IMAGE_NAME + ":" + DEV_IMAGE_VERSION)
+
+    # Add environment variables to command line
+    exec_args: List[str] = []
+    for key in ENV_PASSTHROUGH:
+        value = os.environ.get(key)
+        if value is not None:
+            exec_args.append("--env")
+            exec_args.append(f"{key}={quoted(value)}")
 
     if args.self_test:
         TestDevContainer.docker = docker
@@ -288,14 +318,14 @@ def main(argv: List[str]):
     if args.hermetic:
         # cmd is passed to entrypoint
         quoted_cmd = list(map(quoted, command))
-        docker(f"run --rm", *tty_args, *docker_args, *quoted_cmd).fg()
+        docker(f"run --rm", *tty_args, *docker_args, *exec_args, *quoted_cmd).fg()
     else:
         # cmd is executed directly
         cid = ensure_container_is_alive(docker, docker_args, args.cros)
         if not command:
             command = ("/bin/bash",)
         quoted_cmd = list(map(quoted, command))
-        docker("exec", *tty_args, cid, *quoted_cmd).fg()
+        docker("exec", *tty_args, *exec_args, cid, *quoted_cmd).fg()
 
 
 class TestDevContainer(unittest.TestCase):

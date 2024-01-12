@@ -2,17 +2,19 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::io::Write;
+
 use anyhow::anyhow;
 use argh::FromArgs;
 use libtracecmd::Event;
 use libtracecmd::Handler;
 use libtracecmd::Input;
 use libtracecmd::Record;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::io::Write;
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(FromArgs, Debug)]
 /// Command line parameters.
@@ -404,7 +406,7 @@ fn main() -> anyhow::Result<()> {
                 value: 0,
                 children: layer_data,
             };
-            write_to_file(data, &output)
+            write_to_file(data, &output)?;
         }
         Mode::List(list) => {
             let mut input = Input::new(&list.input)?;
@@ -416,15 +418,16 @@ fn main() -> anyhow::Result<()> {
             let mut list = Vec::new();
             for (name, (latency, count)) in &data {
                 let sum = latency * count;
-                list.push((name, sum));
+                list.push((name, sum, count));
             }
             list.sort_by(|a, b| b.1.cmp(&a.1));
             // print top {count} events of the total value
             if list.len() >= count {
                 list.truncate(count);
             }
-            for i in 0..list.len() {
-                println!("#{}: {}: {} usec", i + 1, list[i].0, list[i].1);
+            println!("name, total (us), count");
+            for (name, sum, cnt) in list {
+                println!("{name}, {sum}, {cnt}");
             }
             return Ok(());
         }
@@ -441,13 +444,13 @@ fn main() -> anyhow::Result<()> {
             }
             let histogram_data = stats.calculate_latency_data().histogram;
 
-            write_to_file(histogram_data, &output);
+            write_to_file(histogram_data, &output)?;
         }
     }
     Ok(())
 }
 
-fn write_to_file<T: serde::Serialize>(data: T, output: &str) {
+fn write_to_file<T: serde::Serialize>(data: T, output: &str) -> anyhow::Result<()> {
     let mut fout = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -455,7 +458,8 @@ fn write_to_file<T: serde::Serialize>(data: T, output: &str) {
         .open(&output)
         .unwrap();
     let serialized = serde_json::to_string(&data).unwrap();
-    fout.write_all(serialized.as_bytes());
+    fout.write_all(serialized.as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]

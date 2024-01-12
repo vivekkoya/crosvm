@@ -24,7 +24,8 @@ use once_cell::sync::Lazy;
 use rand::random;
 use tempfile::tempfile;
 
-static TAP_AVAILABLE: Lazy<bool> = Lazy::new(|| net_util::sys::unix::Tap::new(true, false).is_ok());
+static TAP_AVAILABLE: Lazy<bool> =
+    Lazy::new(|| net_util::sys::linux::Tap::new(true, false).is_ok());
 
 struct RemovePath(PathBuf);
 impl Drop for RemovePath {
@@ -140,6 +141,8 @@ fn test_plugin(src: &str) {
 }
 
 fn keep_fd_on_exec<F: AsRawDescriptor>(f: &F) {
+    // SAFETY: safe because function doesn't modify memory and we don't care about the return
+    // value.
     unsafe {
         ioctl(f, 0x5450 /* FIONCLEX */);
     }

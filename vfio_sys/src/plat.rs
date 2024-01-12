@@ -23,10 +23,18 @@ impl<T> __IncompleteArrayField<T> {
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut _ as *mut T
     }
+    /// # Safety
+    ///
+    /// Caller must ensure that Self's size and alignment requirements match
+    /// those of `T`'s.
     #[inline]
     pub unsafe fn as_slice(&self, len: usize) -> &[T] {
         ::std::slice::from_raw_parts(self.as_ptr(), len)
     }
+    /// # Safety
+    ///
+    /// Caller must ensure that Self's size and alignment requirements match
+    /// those of `T`'s.
     #[inline]
     pub unsafe fn as_mut_slice(&mut self, len: usize) -> &mut [T] {
         ::std::slice::from_raw_parts_mut(self.as_mut_ptr(), len)
@@ -154,6 +162,7 @@ pub union acpi_evt_forward_set__bindgen_ty_1 {
 impl Default for acpi_evt_forward_set__bindgen_ty_1 {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: Safe because s is aligned and is initialized in the block.
         unsafe {
             ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
             s.assume_init()

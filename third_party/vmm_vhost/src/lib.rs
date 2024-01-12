@@ -46,34 +46,23 @@ pub use message::VHOST_USER_F_PROTOCOL_FEATURES;
 pub mod connection;
 
 mod sys;
+pub use connection::Connection;
+pub use message::MasterReq;
+pub use message::SlaveReq;
 pub use sys::SystemStream;
 pub use sys::*;
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub(crate) mod master;
-        pub use self::master::Master;
-        mod master_req_handler;
-        pub use self::master_req_handler::{VhostUserMasterReqHandler,
-                                    VhostUserMasterReqHandlerMut};
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "device")] {
-        mod slave_req_handler;
-        mod slave_proxy;
-        pub use self::slave_req_handler::{
-            SlaveReqHandler, SlaveReqHelper, VhostUserSlaveReqHandler,
-            VhostUserSlaveReqHandlerMut,
-        };
-        pub use self::slave_proxy::Slave;
-    }
-}
-cfg_if::cfg_if! {
-    if #[cfg(feature = "vmm")] {
-        pub use self::master_req_handler::MasterReqHandler;
-    }
-}
+pub(crate) mod master;
+pub use self::master::Master;
+mod master_req_handler;
+pub use self::master_req_handler::VhostUserMasterReqHandler;
+mod slave_proxy;
+mod slave_req_handler;
+pub use self::master_req_handler::MasterReqHandler;
+pub use self::slave_proxy::Slave;
+pub use self::slave_req_handler::SlaveReqHandler;
+pub use self::slave_req_handler::SlaveReqHelper;
+pub use self::slave_req_handler::VhostUserSlaveReqHandler;
 
 /// Errors for vhost-user operations
 #[sorted]
@@ -228,24 +217,22 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Result of request handler.
 pub type HandlerResult<T> = std::result::Result<T, IOError>;
 
-/// Utility function to take the first element from option of a vector of files.
-/// Returns `None` if the vector contains no file or more than one file.
-pub(crate) fn take_single_file(files: Option<Vec<File>>) -> Option<File> {
-    let mut files = files?;
+/// Utility function to convert a vector of files into a single file.
+/// Returns `None` if the vector contains no files or more than one file.
+pub(crate) fn into_single_file(mut files: Vec<File>) -> Option<File> {
     if files.len() != 1 {
         return None;
     }
     Some(files.swap_remove(0))
 }
 
-#[cfg(all(test, feature = "device"))]
+#[cfg(test)]
 mod dummy_slave;
 
-#[cfg(all(test, feature = "vmm", feature = "device"))]
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::Barrier;
-    use std::sync::Mutex;
     use std::thread;
 
     use base::AsRawDescriptor;
@@ -260,9 +247,7 @@ mod tests {
     use crate::VringConfigData;
 
     /// Utility function to process a header and a message together.
-    fn handle_request(
-        h: &mut SlaveReqHandler<Mutex<DummySlaveReqHandler>, MasterReqEndpoint>,
-    ) -> Result<()> {
+    fn handle_request(h: &mut SlaveReqHandler<DummySlaveReqHandler>) -> Result<()> {
         // We assume that a header comes together with message body in tests so we don't wait before
         // calling `process_message()`.
         let (hdr, files) = h.recv_header()?;
@@ -271,7 +256,7 @@ mod tests {
 
     #[test]
     fn create_dummy_slave() {
-        let slave = Mutex::new(DummySlaveReqHandler::new());
+        let mut slave = DummySlaveReqHandler::new();
 
         slave.set_owner().unwrap();
         assert!(slave.set_owner().is_err());
@@ -279,40 +264,37 @@ mod tests {
 
     #[test]
     fn test_set_owner() {
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (master, mut slave) = create_master_slave_pair(slave_be);
 
-        assert!(!slave.as_ref().lock().unwrap().owned);
+        assert!(!slave.as_ref().owned);
         master.set_owner().unwrap();
         handle_request(&mut slave).unwrap();
-        assert!(slave.as_ref().lock().unwrap().owned);
+        assert!(slave.as_ref().owned);
         master.set_owner().unwrap();
         assert!(handle_request(&mut slave).is_err());
-        assert!(slave.as_ref().lock().unwrap().owned);
+        assert!(slave.as_ref().owned);
     }
 
     #[test]
     fn test_set_features() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (mut master, mut slave) = create_master_slave_pair(slave_be);
 
         thread::spawn(move || {
             handle_request(&mut slave).unwrap();
-            assert!(slave.as_ref().lock().unwrap().owned);
+            assert!(slave.as_ref().owned);
+
+            handle_request(&mut slave).unwrap();
+            handle_request(&mut slave).unwrap();
+            assert_eq!(slave.as_ref().acked_features, VIRTIO_FEATURES & !0x1);
 
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
             assert_eq!(
-                slave.as_ref().lock().unwrap().acked_features,
-                VIRTIO_FEATURES & !0x1
-            );
-
-            handle_request(&mut slave).unwrap();
-            handle_request(&mut slave).unwrap();
-            assert_eq!(
-                slave.as_ref().lock().unwrap().acked_protocol_features,
+                slave.as_ref().acked_protocol_features,
                 VhostUserProtocolFeatures::all().bits()
             );
 
@@ -338,26 +320,23 @@ mod tests {
     fn test_master_slave_process() {
         let mbar = Arc::new(Barrier::new(2));
         let sbar = mbar.clone();
-        let slave_be = Mutex::new(DummySlaveReqHandler::new());
+        let slave_be = DummySlaveReqHandler::new();
         let (mut master, mut slave) = create_master_slave_pair(slave_be);
 
         thread::spawn(move || {
             // set_own()
             handle_request(&mut slave).unwrap();
-            assert!(slave.as_ref().lock().unwrap().owned);
+            assert!(slave.as_ref().owned);
 
             // get/set_features()
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
-            assert_eq!(
-                slave.as_ref().lock().unwrap().acked_features,
-                VIRTIO_FEATURES & !0x1
-            );
+            assert_eq!(slave.as_ref().acked_features, VIRTIO_FEATURES & !0x1);
 
             handle_request(&mut slave).unwrap();
             handle_request(&mut slave).unwrap();
             assert_eq!(
-                slave.as_ref().lock().unwrap().acked_protocol_features,
+                slave.as_ref().acked_protocol_features,
                 VhostUserProtocolFeatures::all().bits()
             );
 
@@ -458,8 +437,9 @@ mod tests {
         #[cfg(windows)]
         let tubes = base::Tube::pair().unwrap();
         #[cfg(windows)]
-        // Safe because we will be importing the Tube in the other thread.
         let descriptor =
+            // SAFETY:
+            // Safe because we will be importing the Tube in the other thread.
             unsafe { tube_transporter::packed_tube::pack(tubes.0, std::process::id()).unwrap() };
 
         #[cfg(unix)]

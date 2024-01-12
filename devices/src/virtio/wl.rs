@@ -38,7 +38,6 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::io::IoSliceMut;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
@@ -62,16 +61,17 @@ use base::error;
 use base::ioctl_iow_nr;
 use base::ioctl_iowr_nr;
 use base::ioctl_with_ref;
+use base::linux::SharedMemoryLinux;
 use base::pagesize;
 use base::pipe;
 use base::round_up_to_page_size;
+use base::unix::FileFlags;
 use base::warn;
 use base::AsRawDescriptor;
 use base::Error;
 use base::Event;
 use base::EventToken;
 use base::EventType;
-use base::FileFlags;
 use base::FromRawDescriptor;
 #[cfg(feature = "gpu")]
 use base::IntoRawDescriptor;
@@ -81,12 +81,13 @@ use base::Result;
 use base::SafeDescriptor;
 use base::ScmSocket;
 use base::SharedMemory;
-use base::SharedMemoryUnix;
 use base::Tube;
 use base::TubeError;
+use base::VolatileMemoryError;
 use base::WaitContext;
 use base::WorkerThread;
-use data_model::*;
+use data_model::Le32;
+use data_model::Le64;
 #[cfg(feature = "minigbm")]
 use libc::EBADF;
 #[cfg(feature = "minigbm")]
@@ -118,6 +119,7 @@ use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 #[cfg(feature = "gpu")]
 use super::resource_bridge::get_resource_info;
@@ -213,6 +215,7 @@ ioctl_iowr_nr!(SYNC_IOC_FILE_INFO, 0x3e, 4, sync_file_info);
 
 fn is_fence(f: &File) -> bool {
     let info = sync_file_info::default();
+    // SAFETY:
     // Safe as f is a valid file
     unsafe { ioctl_with_ref(f, SYNC_IOC_FILE_INFO(), &info) == 0 }
 }
@@ -371,6 +374,8 @@ enum WlError {
     DmabufSync(io::Error),
     #[error("failed to create shared memory from descriptor: {0}")]
     FromSharedMemory(Error),
+    #[error("failed to get seals: {0}")]
+    GetSeals(Error),
     #[error("gralloc error: {0}")]
     #[cfg(feature = "minigbm")]
     GrallocError(#[from] RutabagaError),
@@ -440,6 +445,7 @@ struct VmRequester {
 // The following are wrappers to avoid base dependencies in the rutabaga crate
 #[cfg(feature = "minigbm")]
 fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
+    // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
     unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
@@ -523,27 +529,23 @@ impl VmRequester {
                 .context("failed to dup gfx handle")
                 .map_err(WlError::ShmemMapperError)?,
             reqs.size,
+            Protection::read_write(),
         )
         .map(|info| (info, safe_descriptor, reqs))
     }
 
     fn register_shmem(&self, shm: &SharedMemory) -> WlResult<u64> {
-        self.register_memory(
-            SafeDescriptor::try_from(shm as &dyn AsRawDescriptor)
-                .context("failed to create safe descriptor")
-                .map_err(WlError::ShmemMapperError)?,
-            shm.size(),
-        )
-    }
-
-    fn register_memory(&self, descriptor: SafeDescriptor, size: u64) -> WlResult<u64> {
-        let mut state = self.state.borrow_mut();
-        let size = round_up_to_page_size(size as usize) as u64;
-
-        let prot = match FileFlags::from_file(&descriptor) {
+        let prot = match FileFlags::from_file(shm) {
             Ok(FileFlags::Read) => Protection::read(),
             Ok(FileFlags::Write) => Protection::write(),
-            Ok(FileFlags::ReadWrite) => Protection::read_write(),
+            Ok(FileFlags::ReadWrite) => {
+                let seals = shm.get_seals().map_err(WlError::GetSeals)?;
+                if seals.write_seal() {
+                    Protection::read()
+                } else {
+                    Protection::read_write()
+                }
+            }
             Err(e) => {
                 return Err(WlError::ShmemMapperError(anyhow!(
                     "failed to get file descriptor flags with error: {:?}",
@@ -551,6 +553,23 @@ impl VmRequester {
                 )))
             }
         };
+        self.register_memory(
+            SafeDescriptor::try_from(shm as &dyn AsRawDescriptor)
+                .context("failed to create safe descriptor")
+                .map_err(WlError::ShmemMapperError)?,
+            shm.size(),
+            prot,
+        )
+    }
+
+    fn register_memory(
+        &self,
+        descriptor: SafeDescriptor,
+        size: u64,
+        prot: Protection,
+    ) -> WlResult<u64> {
+        let mut state = self.state.borrow_mut();
+        let size = round_up_to_page_size(size as usize) as u64;
 
         let source = VmMemorySource::Descriptor {
             descriptor,
@@ -583,14 +602,14 @@ impl VmRequester {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 struct CtrlHeader {
     type_: Le32,
     flags: Le32,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Default, FromZeroes, FromBytes, AsBytes)]
 struct CtrlVfdNew {
     hdr: CtrlHeader,
     id: Le32,
@@ -601,7 +620,7 @@ struct CtrlVfdNew {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, FromBytes)]
+#[derive(Copy, Clone, Default, FromZeroes, FromBytes)]
 struct CtrlVfdNewCtxNamed {
     hdr: CtrlHeader,
     id: Le32,
@@ -612,7 +631,7 @@ struct CtrlVfdNewCtxNamed {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 #[cfg(feature = "minigbm")]
 struct CtrlVfdNewDmabuf {
     hdr: CtrlHeader,
@@ -633,7 +652,7 @@ struct CtrlVfdNewDmabuf {
 
 #[cfg(feature = "minigbm")]
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 #[cfg(feature = "minigbm")]
 struct CtrlVfdDmabufSync {
     hdr: CtrlHeader,
@@ -642,7 +661,7 @@ struct CtrlVfdDmabufSync {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, AsBytes, FromBytes)]
+#[derive(Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 struct CtrlVfdRecv {
     hdr: CtrlHeader,
     id: Le32,
@@ -650,14 +669,14 @@ struct CtrlVfdRecv {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 struct CtrlVfd {
     hdr: CtrlHeader,
     id: Le32,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 struct CtrlVfdSend {
     hdr: CtrlHeader,
     id: Le32,
@@ -666,21 +685,21 @@ struct CtrlVfdSend {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Default, AsBytes, FromZeroes, FromBytes)]
 struct CtrlVfdSendVfd {
     kind: Le32,
     id: Le32,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, FromBytes)]
+#[derive(Copy, Clone, FromZeroes, FromBytes)]
 union CtrlVfdSendVfdV2Payload {
     id: Le32,
     seqno: Le64,
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, FromBytes)]
+#[derive(Copy, Clone, FromZeroes, FromBytes)]
 struct CtrlVfdSendVfdV2 {
     kind: Le32,
     payload: CtrlVfdSendVfdV2Payload,
@@ -692,11 +711,13 @@ impl CtrlVfdSendVfdV2 {
             self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL
                 || self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU
         );
+        // SAFETY: trivially safe given we assert kind
         unsafe { self.payload.id }
     }
     #[cfg(feature = "gpu")]
     fn seqno(&self) -> Le64 {
         assert!(self.kind == VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_FENCE);
+        // SAFETY: trivially safe given we assert kind
         unsafe { self.payload.seqno }
     }
 }
@@ -765,7 +786,7 @@ impl<'a> WlResp<'a> {
 
 #[derive(Default)]
 struct WlVfd {
-    socket: Option<UnixStream>,
+    socket: Option<ScmSocket<UnixStream>>,
     guest_shared_memory: Option<SharedMemory>,
     remote_pipe: Option<File>,
     local_pipe: Option<(u32 /* flags */, File)>,
@@ -799,7 +820,7 @@ impl WlVfd {
     fn connect<P: AsRef<Path>>(path: P) -> WlResult<WlVfd> {
         let socket = UnixStream::connect(path).map_err(WlError::SocketConnect)?;
         let mut vfd = WlVfd::default();
-        vfd.socket = Some(socket);
+        vfd.socket = Some(socket.try_into().map_err(WlError::SocketConnect)?);
         Ok(vfd)
     }
 
@@ -853,6 +874,7 @@ impl WlVfd {
                 let sync = dma_buf_sync {
                     flags: flags as u64,
                 };
+                // SAFETY:
                 // Safe as descriptor is a valid dmabuf and incorrect flags will return an error.
                 if unsafe { ioctl_with_ref(descriptor, DMA_BUF_IOCTL_SYNC(), &sync) } < 0 {
                     Err(WlError::DmabufSync(io::Error::last_os_error()))
@@ -972,7 +994,7 @@ impl WlVfd {
     fn send(&mut self, rds: &[RawDescriptor], data: &mut Reader) -> WlResult<WlResp> {
         if let Some(socket) = &self.socket {
             socket
-                .send_with_fds(&data.get_remaining(), rds)
+                .send_vectored_with_fds(&data.get_remaining(), rds)
                 .map_err(WlError::SendVfd)?;
             // All remaining data in `data` is now considered consumed.
             data.consume(::std::usize::MAX);
@@ -994,29 +1016,21 @@ impl WlVfd {
     fn recv(&mut self, in_file_queue: &mut Vec<File>) -> WlResult<Vec<u8>> {
         if let Some(socket) = self.socket.take() {
             let mut buf = vec![0; IN_BUFFER_LEN];
-            let mut fd_buf = [0; VIRTWL_SEND_MAX_ALLOCS];
             // If any errors happen, the socket will get dropped, preventing more reading.
-            let (len, file_count) = socket
-                .recv_with_fds(IoSliceMut::new(&mut buf), &mut fd_buf)
+            let (len, descriptors) = socket
+                .recv_with_fds(&mut buf, VIRTWL_SEND_MAX_ALLOCS)
                 .map_err(WlError::RecvVfd)?;
             // If any data gets read, the put the socket back for future recv operations.
-            if len != 0 || file_count != 0 {
+            if len != 0 || !descriptors.is_empty() {
                 buf.truncate(len);
                 buf.shrink_to_fit();
                 self.socket = Some(socket);
-                // Safe because the first file_counts fds from recv_with_fds are owned by us and
-                // valid.
-                in_file_queue.extend(
-                    fd_buf[..file_count]
-                        .iter()
-                        .map(|&descriptor| unsafe { File::from_raw_descriptor(descriptor) }),
-                );
+                in_file_queue.extend(descriptors.into_iter().map(File::from));
                 return Ok(buf);
             }
             Ok(Vec::new())
         } else if let Some((flags, mut local_pipe)) = self.local_pipe.take() {
-            let mut buf = Vec::new();
-            buf.resize(IN_BUFFER_LEN, 0);
+            let mut buf = vec![0; IN_BUFFER_LEN];
             let len = local_pipe.read(&mut buf[..]).map_err(WlError::ReadPipe)?;
             if len != 0 {
                 buf.truncate(len);
@@ -1421,6 +1435,7 @@ impl WlState {
                     match self.signaled_fence.as_ref().unwrap().try_clone() {
                         Ok(dup) => {
                             *descriptor = dup.into_raw_descriptor();
+                            // SAFETY:
                             // Safe because the fd comes from a valid SafeDescriptor.
                             let file = unsafe { File::from_raw_descriptor(*descriptor) };
                             bridged_files.push(file);
@@ -1721,7 +1736,7 @@ pub fn process_in_queue(
             }
             let bytes_written = desc.writer.bytes_written() as u32;
             needs_interrupt = true;
-            in_queue.pop_peeked();
+            let desc = desc.pop();
             in_queue.add_used(desc, bytes_written);
         } else {
             break;

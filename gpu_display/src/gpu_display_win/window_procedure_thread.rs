@@ -2,8 +2,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::any::type_name;
+use std::any::TypeId;
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::marker::PhantomData;
 use std::mem;
 use std::os::windows::io::RawHandle;
 use std::pin::Pin;
@@ -29,6 +32,10 @@ use base::Event;
 use base::ReadNotifier;
 use base::Tube;
 use euclid::size2;
+use once_cell::sync::OnceCell;
+use serde::Deserialize;
+use serde::Serialize;
+use sync::Mutex;
 #[cfg(feature = "kiwi")]
 use vm_control::ServiceSendToGpu;
 use win_util::syscall_bail;
@@ -45,6 +52,7 @@ use winapi::um::winbase::WAIT_OBJECT_0;
 use winapi::um::winnt::MAXIMUM_WAIT_OBJECTS;
 use winapi::um::winuser::*;
 
+use super::window::get_current_module_handle;
 use super::window::GuiWindow;
 use super::window::MessageOnlyWindow;
 use super::window::MessagePacket;
@@ -144,20 +152,98 @@ impl MsgWaitContext {
     }
 }
 
+trait RegisterWindowClass: 'static {
+    // Only for debug purpose. Not required to be unique across different implementors.
+    const CLASS_NAME_PREFIX: &'static str = "";
+    fn register_window_class(class_name: &str, wnd_proc: WNDPROC) -> Result<()>;
+}
+
+impl RegisterWindowClass for GuiWindow {
+    const CLASS_NAME_PREFIX: &'static str = "CROSVM";
+
+    fn register_window_class(class_name: &str, wnd_proc: WNDPROC) -> Result<()> {
+        let hinstance = get_current_module_handle();
+        // If we fail to load any UI element below, use NULL to let the system use the default UI
+        // rather than crash.
+        let hicon = Self::load_custom_icon(hinstance, APP_ICON_ID).unwrap_or(null_mut());
+        let hcursor = Self::load_system_cursor(IDC_ARROW).unwrap_or(null_mut());
+        let hbrush_background = Self::create_opaque_black_brush().unwrap_or(null_mut());
+        let class_name = win32_wide_string(class_name);
+        let window_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: CS_OWNDC | CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: wnd_proc,
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: hicon,
+            hCursor: hcursor,
+            hbrBackground: hbrush_background,
+            lpszMenuName: null_mut(),
+            lpszClassName: class_name.as_ptr(),
+            hIconSm: hicon,
+        };
+
+        // SAFETY:
+        // Safe because we know the lifetime of `window_class`, and we handle failures below.
+        if unsafe { RegisterClassExW(&window_class) } == 0 {
+            syscall_bail!("Failed to call RegisterClassExW()");
+        }
+        Ok(())
+    }
+}
+
+impl RegisterWindowClass for MessageOnlyWindow {
+    const CLASS_NAME_PREFIX: &'static str = "THREAD_MESSAGE_ROUTER";
+
+    fn register_window_class(class_name: &str, wnd_proc: WNDPROC) -> Result<()> {
+        let hinstance = get_current_module_handle();
+        let class_name = win32_wide_string(class_name);
+        let window_class = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: wnd_proc,
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: null_mut(),
+            hCursor: null_mut(),
+            hbrBackground: null_mut(),
+            lpszMenuName: null_mut(),
+            lpszClassName: class_name.as_ptr(),
+            hIconSm: null_mut(),
+        };
+
+        // SAFETY:
+        // Safe because we know the lifetime of `window_class`, and we handle failures below.
+        if unsafe { RegisterClassExW(&window_class) } == 0 {
+            syscall_bail!("Failed to call RegisterClassExW()");
+        }
+        Ok(())
+    }
+}
+
 /// This class runs the WndProc thread, and provides helper functions for other threads to
 /// communicate with it.
-pub struct WindowProcedureThread<T: HandleWindowMessage> {
+pub struct WindowProcedureThread {
     thread: Option<JoinHandle<()>>,
     message_router_handle: HWND,
     message_loop_state: Option<Arc<AtomicI32>>,
     thread_terminated_event: Event,
-    _marker: PhantomData<T>,
 }
 
-impl<T: HandleWindowMessage> WindowProcedureThread<T> {
-    pub fn start_thread(
-        #[cfg(feature = "kiwi")] gpu_main_display_tube: Option<Tube>,
-    ) -> Result<Self> {
+impl WindowProcedureThread {
+    pub fn builder() -> WindowProcedureThreadBuilder {
+        // We don't implement Default for WindowProcedureThreadBuilder so that the builder function
+        // is the only way to create WindowProcedureThreadBuilder.
+        WindowProcedureThreadBuilder {
+            display_tube: None,
+            #[cfg(feature = "kiwi")]
+            ime_tube: None,
+        }
+    }
+
+    fn start_thread(gpu_main_display_tube: Option<Tube>) -> Result<Self> {
         let (message_router_handle_sender, message_router_handle_receiver) = channel();
         let message_loop_state = Arc::new(AtomicI32::new(MessageLoopState::NotStarted as i32));
         let thread_terminated_event = Event::new().unwrap();
@@ -167,8 +253,6 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
             .try_clone()
             .map_err(|e| anyhow!("Failed to clone thread_terminated_event: {}", e))?;
 
-        #[cfg(not(feature = "kiwi"))]
-        let gpu_main_display_tube = None;
         let thread = match ThreadBuilder::new()
             .name("gpu_display_wndproc".into())
             .spawn(move || {
@@ -193,7 +277,6 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
                     message_router_handle: message_router_handle as HWND,
                     message_loop_state: Some(message_loop_state),
                     thread_terminated_event,
-                    _marker: PhantomData,
                 }),
                 Err(e) => bail!("WndProc internal failure: {:?}", e),
             },
@@ -207,7 +290,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
             .map_err(|e| anyhow!("Failed to clone thread_terminated_event: {}", e))
     }
 
-    pub fn post_display_command(&self, message: DisplaySendToWndProc<T>) -> Result<()> {
+    pub fn post_display_command(&self, message: DisplaySendToWndProc) -> Result<()> {
         self.post_message_to_thread_carrying_object(
             WM_USER_HANDLE_DISPLAY_MESSAGE_INTERNAL,
             message,
@@ -220,6 +303,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         if !self.is_message_loop_running() {
             bail!("Cannot post message to WndProc thread because message loop is not running!");
         }
+        // SAFETY:
         // Safe because the message loop is still running.
         if unsafe { PostMessageW(self.message_router_handle, msg, w_param, l_param) } == 0 {
             syscall_bail!("Failed to call PostMessageW()");
@@ -248,10 +332,11 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         gpu_main_display_tube: Option<Tube>,
     ) {
         let gpu_main_display_tube = gpu_main_display_tube.map(Rc::new);
+        // SAFETY:
         // Safe because the dispatcher will take care of the lifetime of the `MessageOnlyWindow` and
         // `GuiWindow` objects.
         match unsafe { Self::create_windows() }.and_then(|(message_router_window, gui_window)| {
-            WindowMessageDispatcher::<T>::create(
+            WindowMessageDispatcher::create(
                 message_router_window,
                 gui_window,
                 gpu_main_display_tube.clone(),
@@ -261,8 +346,9 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
                 info!("WndProc thread entering message loop");
                 message_loop_state.store(MessageLoopState::Running as i32, Ordering::SeqCst);
 
-                // Safe because we won't use the handle unless the message loop is still running.
                 let message_router_handle =
+                    // SAFETY:
+                    // Safe because we won't use the handle unless the message loop is still running.
                     unsafe { dispatcher.message_router_handle().unwrap_or(null_mut()) };
                 // HWND cannot be sent cross threads, so we cast it to u32 first.
                 if let Err(e) = message_router_handle_sender.send(Ok(message_router_handle as u32))
@@ -288,10 +374,9 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
 
     fn run_message_loop_body(
         #[cfg_attr(not(feature = "kiwi"), allow(unused_variables, unused_mut))]
-        mut message_dispatcher: Pin<Box<WindowMessageDispatcher<T>>>,
+        mut message_dispatcher: Pin<Box<WindowMessageDispatcher>>,
         gpu_main_display_tube: Option<Rc<Tube>>,
     ) -> MessageLoopState {
-        #[cfg_attr(not(feature = "kiwi"), allow(unused_mut))]
         let mut msg_wait_ctx = MsgWaitContext::new();
         if let Some(tube) = &gpu_main_display_tube {
             if let Err(e) = msg_wait_ctx.add(tube.get_read_notifier(), Token::ServiceMessage) {
@@ -304,6 +389,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         }
 
         loop {
+            // SAFETY:
             // Safe because the lifetime of handles are at least as long as the function call.
             match unsafe { msg_wait_ctx.wait() } {
                 Ok(token) => match token {
@@ -349,6 +435,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
             // Safe because if `message` is initialized, we will call `assume_init()` to extract the
             // value, which will get dropped eventually.
             let mut message = mem::MaybeUninit::uninit();
+            // SAFETY:
             // Safe because `message` lives at least as long as the function call.
             if unsafe {
                 PeekMessageW(
@@ -363,6 +450,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
                 return true;
             }
 
+            // SAFETY:
             // Safe because `PeekMessageW()` has populated `message`.
             unsafe {
                 let new_message = message.assume_init();
@@ -377,7 +465,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
 
     #[cfg(feature = "kiwi")]
     fn read_and_dispatch_service_message(
-        message_dispatcher: &mut Pin<Box<WindowMessageDispatcher<T>>>,
+        message_dispatcher: &mut Pin<Box<WindowMessageDispatcher>>,
         gpu_main_display_tube: &Tube,
     ) {
         match gpu_main_display_tube.recv::<ServiceSendToGpu>() {
@@ -392,7 +480,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
 
     #[cfg(not(feature = "kiwi"))]
     fn read_and_dispatch_service_message(
-        _: &mut Pin<Box<WindowMessageDispatcher<T>>>,
+        _: &mut Pin<Box<WindowMessageDispatcher>>,
         _gpu_main_display_tube: &Tube,
     ) {
     }
@@ -446,8 +534,15 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
     /// processing `WM_NCDESTROY`, because the window handle will become invalid afterwards.
     unsafe fn create_windows() -> Result<(MessageOnlyWindow, GuiWindow)> {
         let message_router_window = MessageOnlyWindow::new(
-            Some(Self::wnd_proc),
-            /* class_name */ "THREAD_MESSAGE_ROUTER",
+            /* class_name */
+            Self::get_window_class_name::<MessageOnlyWindow>()
+                .with_context(|| {
+                    format!(
+                        "retrieve the window class name for MessageOnlyWindow of {}.",
+                        type_name::<Self>()
+                    )
+                })?
+                .as_str(),
             /* title */ "ThreadMessageRouter",
         )?;
         // Gfxstream window is a child window of crosvm window. Without WS_CLIPCHILDREN, the parent
@@ -455,10 +550,16 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         // drawing occurs. This caused the screen flickering issue during resizing.
         // See b/197786842 for details.
         let gui_window = GuiWindow::new(
-            Some(Self::wnd_proc),
-            /* class_name */ "CROSVM",
-            /* title */ "crosvm",
-            APP_ICON_ID,
+            /* class_name */
+            Self::get_window_class_name::<GuiWindow>()
+                .with_context(|| {
+                    format!(
+                        "retrieve the window class name for GuiWindow of {}",
+                        type_name::<Self>()
+                    )
+                })?
+                .as_str(),
+            /* title */ Self::get_window_title().as_str(),
             WS_POPUP | WS_CLIPCHILDREN,
             // The window size and style can be adjusted later when `Surface` is created.
             &size2(1, 1),
@@ -473,7 +574,7 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         l_param: LPARAM,
     ) -> LRESULT {
         let dispatcher_ptr = GetPropW(hwnd, win32_wide_string(DISPATCHER_PROPERTY_NAME).as_ptr())
-            as *mut WindowMessageDispatcher<T>;
+            as *mut WindowMessageDispatcher;
         if let Some(dispatcher) = dispatcher_ptr.as_mut() {
             if let Some(ret) =
                 dispatcher.dispatch_window_message(hwnd, &MessagePacket::new(msg, w_param, l_param))
@@ -483,9 +584,42 @@ impl<T: HandleWindowMessage> WindowProcedureThread<T> {
         }
         DefWindowProcW(hwnd, msg, w_param, l_param)
     }
+
+    /// U + T decides one window class. For the same combination of U + T, the same window class
+    /// name will be returned. This function also registers the Window class if it is not registered
+    /// through this function yet.
+    fn get_window_class_name<T: RegisterWindowClass>() -> Result<String> {
+        static WINDOW_CLASS_NAMES: OnceCell<Mutex<BTreeMap<TypeId, String>>> = OnceCell::new();
+        let mut window_class_names = WINDOW_CLASS_NAMES.get_or_init(Default::default).lock();
+        let id = window_class_names.len();
+        let entry = window_class_names.entry(TypeId::of::<T>());
+        let entry = match entry {
+            Entry::Occupied(entry) => return Ok(entry.get().clone()),
+            Entry::Vacant(entry) => entry,
+        };
+        // We are generating a different class name everytime we reach this line, so the name
+        // shouldn't collide with any window classes registered through this function. The
+        // underscore here is important. If we just use `"{}{}"`, we may collide for prefix = "" and
+        // prefix = "1".
+        let window_class_name = format!("{}_{}", T::CLASS_NAME_PREFIX, id);
+        T::register_window_class(&window_class_name, Some(Self::wnd_proc)).with_context(|| {
+            format!(
+                "Failed to register the window class for ({}, {}), with name {}.",
+                type_name::<Self>(),
+                type_name::<T>(),
+                window_class_name
+            )
+        })?;
+        entry.insert(window_class_name.clone());
+        Ok(window_class_name)
+    }
+
+    fn get_window_title() -> String {
+        "crosvm".to_string()
+    }
 }
 
-impl<T: HandleWindowMessage> Drop for WindowProcedureThread<T> {
+impl Drop for WindowProcedureThread {
     fn drop(&mut self) {
         self.signal_exit_message_loop_if_needed();
         match self.thread.take().unwrap().join() {
@@ -495,10 +629,46 @@ impl<T: HandleWindowMessage> Drop for WindowProcedureThread<T> {
     }
 }
 
-// `Send` may not be automatically inherited because of the `PhantomData`.
+// SAFETY:
 // Since `WindowProcedureThread` does not hold anything that cannot be transferred between threads,
 // we can implement `Send` for it.
-unsafe impl<T: HandleWindowMessage> Send for WindowProcedureThread<T> {}
+unsafe impl Send for WindowProcedureThread {}
+
+#[derive(Deserialize, Serialize)]
+pub struct WindowProcedureThreadBuilder {
+    display_tube: Option<Tube>,
+    #[cfg(feature = "kiwi")]
+    ime_tube: Option<Tube>,
+}
+
+impl WindowProcedureThreadBuilder {
+    pub fn set_display_tube(&mut self, display_tube: Option<Tube>) -> &mut Self {
+        self.display_tube = display_tube;
+        self
+    }
+
+    #[cfg(feature = "kiwi")]
+    pub fn set_ime_tube(&mut self, ime_tube: Option<Tube>) -> &mut Self {
+        self.ime_tube = ime_tube;
+        self
+    }
+
+    /// This function creates the window procedure thread and windows.
+    ///
+    /// We have seen third-party DLLs hooking into window creation. They may have deep call stack,
+    /// and they may not be well tested against late window creation, which may lead to stack
+    /// overflow. Hence, this should be called as early as possible when the VM is booting.
+    pub fn start_thread(self) -> Result<WindowProcedureThread> {
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "kiwi")] {
+                let ime_tube = self.ime_tube.ok_or_else(|| anyhow!("The ime tube is not set."))?;
+                WindowProcedureThread::start_thread(self.display_tube, ime_tube)
+            } else {
+                WindowProcedureThread::start_thread(None)
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -517,5 +687,59 @@ mod tests {
         let event = Event::new().unwrap();
         assert!(ctx.add(&event, Token::ServiceMessage).is_ok());
         assert!(ctx.add(&event, Token::ServiceMessage).is_err());
+    }
+
+    #[test]
+    fn window_procedure_window_class_name_should_include_class_name_prefix() {
+        const PREFIX: &str = "test-window-class-prefix";
+        struct TestWindow;
+        impl RegisterWindowClass for TestWindow {
+            const CLASS_NAME_PREFIX: &'static str = PREFIX;
+            fn register_window_class(_class_name: &str, _wnd_proc: WNDPROC) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let name = WindowProcedureThread::get_window_class_name::<TestWindow>().unwrap();
+        assert!(
+            name.starts_with(PREFIX),
+            "The class name {} should start with {}.",
+            name,
+            PREFIX
+        );
+    }
+
+    #[test]
+    fn window_procedure_with_same_types_should_return_same_name() {
+        struct TestWindow;
+        impl RegisterWindowClass for TestWindow {
+            fn register_window_class(_class_name: &str, _wnd_proc: WNDPROC) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let name1 = WindowProcedureThread::get_window_class_name::<TestWindow>().unwrap();
+        let name2 = WindowProcedureThread::get_window_class_name::<TestWindow>().unwrap();
+        assert_eq!(name1, name2);
+    }
+
+    #[test]
+    fn window_procedure_with_different_types_should_return_different_names() {
+        struct TestWindow1;
+        impl RegisterWindowClass for TestWindow1 {
+            fn register_window_class(_class_name: &str, _wnd_proc: WNDPROC) -> Result<()> {
+                Ok(())
+            }
+        }
+        struct TestWindow2;
+        impl RegisterWindowClass for TestWindow2 {
+            fn register_window_class(_class_name: &str, _wnd_proc: WNDPROC) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let name1 = WindowProcedureThread::get_window_class_name::<TestWindow1>().unwrap();
+        let name2 = WindowProcedureThread::get_window_class_name::<TestWindow2>().unwrap();
+        assert_ne!(name1, name2);
     }
 }

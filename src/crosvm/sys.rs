@@ -2,18 +2,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(unix)]
-pub(crate) mod unix;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub(crate) mod linux;
 
 #[cfg(windows)]
 pub(crate) mod windows;
 
 cfg_if::cfg_if! {
-    if #[cfg(unix)] {
-        use unix as platform;
+    if #[cfg(any(target_os = "android", target_os = "linux"))] {
+        use linux as platform;
 
         #[cfg(feature = "gpu")]
-        pub(crate) use unix::gpu::GpuRenderServerParameters;
+        pub(crate) use linux::gpu::GpuRenderServerParameters;
     } else if #[cfg(windows)] {
         use windows as platform;
         #[cfg(feature = "pci-hotplug")]

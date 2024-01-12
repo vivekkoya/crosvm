@@ -2,12 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 use std::net;
 
 use base::test_utils::call_test_with_sudo;
-use net_util::sys::unix::Tap;
+use net_util::sys::linux::Tap;
+use net_util::sys::linux::TapTLinux;
 use net_util::MacAddress;
 use net_util::TapTCommon;
 

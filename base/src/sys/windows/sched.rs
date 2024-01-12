@@ -22,7 +22,7 @@ use super::Result;
 /// 0, 1, 5, and 6.
 ///
 /// ```
-/// # use base::platform::set_cpu_affinity;
+/// # use base::windows::set_cpu_affinity;
 ///   set_cpu_affinity(vec![0, 1, 5, 6]).unwrap();
 /// ```
 pub fn set_cpu_affinity<I: IntoIterator<Item = usize>>(cpus: I) -> Result<usize> {
@@ -37,6 +37,7 @@ pub fn set_cpu_affinity<I: IntoIterator<Item = usize>>(cpus: I) -> Result<usize>
 }
 
 pub fn set_cpu_affinity_mask(affinity_mask: usize) -> Result<usize> {
+    // SAFETY: trivially safe as return value is checked.
     let res: usize = unsafe {
         let thread_handle = GetCurrentThread();
         SetThreadAffinityMask(thread_handle, affinity_mask)
@@ -63,6 +64,7 @@ mod tests {
     fn cpu_affinity() {
         let mut process_affinity_mask: usize = 0;
         let mut system_affinity_mask: usize = 0;
+        // SAFETY: trivially safe as return value is checked.
         let res = unsafe {
             GetProcessAffinityMask(
                 GetCurrentProcess(),

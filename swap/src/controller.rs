@@ -23,10 +23,10 @@ use anyhow::Context;
 use base::debug;
 use base::error;
 use base::info;
+use base::linux::process::fork_process;
+use base::linux::process::Child;
+use base::linux::FileDataIterator;
 use base::syslog;
-use base::unix::process::fork_process;
-use base::unix::process::Child;
-use base::unix::FileDataIterator;
 use base::warn;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
@@ -35,6 +35,7 @@ use base::RawDescriptor;
 use base::SendTube;
 use base::SharedMemory;
 use base::Tube;
+use base::TubeError;
 use base::WaitContext;
 use jail::create_base_minijail;
 use jail::create_sandbox_minijail;
@@ -113,7 +114,7 @@ enum Command {
     Exit,
     Status,
     ProcessForked {
-        #[serde(with = "base::platform::with_as_descriptor")]
+        #[serde(with = "base::with_as_descriptor")]
         uffd: Userfaultfd,
         reply_tube: Tube,
     },
@@ -122,13 +123,16 @@ enum Command {
 
 /// [SwapController] provides APIs to control vmm-swap.
 pub struct SwapController {
-    child_process: Child,
+    child_process: Option<Child>,
     uffd_factory: UffdFactory,
     command_tube: Tube,
     num_static_devices: u32,
     // Keep 1 page dummy mmap in the main process to make it present in all the descendant
     // processes.
     _dead_uffd_checker: DeadUffdCheckerImpl,
+    // Keep the cloned [GuestMemory] in the main process not to free it before the monitor process
+    // exits.
+    _guest_memory: GuestMemory,
 }
 
 impl SwapController {
@@ -147,6 +151,8 @@ impl SwapController {
         jail_config: &Option<JailConfig>,
     ) -> anyhow::Result<Self> {
         info!("vmm-swap is enabled. launch monitor process.");
+
+        let preserved_guest_memory = guest_memory.clone();
 
         let uffd_factory = UffdFactory::new();
         let uffd = uffd_factory.create().context("create userfaultfd")?;
@@ -226,7 +232,29 @@ impl SwapController {
                     #[cfg(feature = "log_page_fault")]
                     page_fault_logger,
                 ) {
-                    panic!("page_fault_handler_thread exited with error: {:?}", e)
+                    if let Some(PageHandlerError::Userfaultfd(UffdError::UffdClosed)) =
+                        e.downcast_ref::<PageHandlerError>()
+                    {
+                        // Userfaultfd can cause UffdError::UffdClosed if the main process
+                        // unexpectedly while it is swapping in. This is not a bug of swap monitor,
+                        // but the other feature on the main process.
+                        // Note that UffdError::UffdClosed from other processes than the main
+                        // process are derived from PageHandler::handle_page_fault() only and
+                        // handled in the loop of handle_vmm_swap().
+                        error!(
+                            "page_fault_handler_thread exited with userfaultfd closed error: {:#}",
+                            e
+                        );
+                    } else if e.is::<TubeError>() {
+                        // Tube can cause TubeError if the main process unexpectedly dies. This is
+                        // not a bug of swap monitor, but the other feature on the main process.
+                        // Even if the tube itself is broken and the main process is alive, the main
+                        // process catch that the swap monitor process exits unexpectedly and
+                        // terminates itself.
+                        error!("page_fault_handler_thread exited with tube error: {:#}", e);
+                    } else {
+                        panic!("page_fault_handler_thread exited with error: {:#}", e);
+                    }
                 }
             })
             .context("fork monitor process")?;
@@ -249,11 +277,12 @@ impl SwapController {
         };
 
         Ok(Self {
-            child_process,
+            child_process: Some(child_process),
             uffd_factory,
             command_tube: command_tube_main,
             num_static_devices: 0,
             _dead_uffd_checker: dead_uffd_checker,
+            _guest_memory: preserved_guest_memory,
         })
     }
 
@@ -331,28 +360,19 @@ impl SwapController {
         Ok(status)
     }
 
-    /// Shutdown the monitor process.
-    ///
-    /// This blocks until the monitor process exits.
-    ///
-    /// This should be called once.
-    pub fn exit(self) -> anyhow::Result<()> {
-        self.command_tube
-            .send(&Command::Exit)
-            .context("send exit command")?;
-        self.child_process
-            .wait()
-            .context("wait monitor process shutdown")?;
-        Ok(())
-    }
-
     /// Suspend device processes using `SIGSTOP` signal.
     ///
     /// When the returned `ProcessesGuard` is dropped, the devices resume.
     ///
     /// This must be called from the main process.
     pub fn suspend_devices(&self) -> anyhow::Result<ProcessesGuard> {
-        freeze_child_processes(self.child_process.pid)
+        // child_process become none on dropping SwapController.
+        freeze_child_processes(
+            self.child_process
+                .as_ref()
+                .expect("monitor process not exist")
+                .pid,
+        )
     }
 
     /// Notify the monitor process that all static devices are forked.
@@ -381,6 +401,28 @@ impl SwapController {
             uffd_factory,
             command_tube,
         })
+    }
+}
+
+impl Drop for SwapController {
+    fn drop(&mut self) {
+        // Shutdown the monitor process.
+        // This blocks until the monitor process exits.
+        if let Err(e) = self.command_tube.send(&Command::Exit) {
+            error!(
+                "failed to sent exit command to vmm-swap monitor process: {:#}",
+                e
+            );
+            return;
+        }
+        if let Err(e) = self
+            .child_process
+            .take()
+            .expect("monitor process not exist")
+            .wait()
+        {
+            error!("failed to wait vmm-swap monitor process shutdown: {:#}", e);
+        }
     }
 }
 
@@ -622,6 +664,7 @@ fn monitor_process(
                         };
 
                         // TODO(b/272634283): Should just disable vmm-swap without crash.
+                        // SAFETY:
                         // Safe because the regions are from guest memory and uffd_list contains all
                         // the processes of crosvm.
                         unsafe { register_regions(&regions, uffd_list.get_list()) }
@@ -799,6 +842,7 @@ fn move_guest_to_staging(
     let mut pages = 0;
 
     let result = guest_memory.regions().try_for_each(|region| {
+        // SAFETY:
         // safe because:
         // * all the regions are registered to all userfaultfd
         // * no process access the guest memory
@@ -960,11 +1004,11 @@ fn handle_vmm_swap<'scope, 'env>(
                 {
                     Command::ProcessForked { uffd, reply_tube } => {
                         debug!("new fork uffd: {:?}", uffd);
-                        // SAFETY: regions is generated from the guest memory
-                        // SAFETY: the uffd is from a new process.
-                        let result = if let Err(e) =
+                        let result = if let Err(e) = {
+                            // SAFETY: regions is generated from the guest memory
+                            // SAFETY: the uffd is from a new process.
                             unsafe { register_regions(regions, std::array::from_ref(&uffd)) }
-                        {
+                        } {
                             error!("failed to setup uffd: {:?}", e);
                             false
                         } else {

@@ -48,6 +48,7 @@ use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use super::copy_config;
 use super::DeviceType;
@@ -74,7 +75,7 @@ const VIRTIO_PVCLOCK_S_IOERR: u8 = 1;
 
 const VIRTIO_PVCLOCK_CLOCKSOURCE_RATING: u32 = 450;
 
-#[derive(Debug, Clone, Copy, Default, AsBytes, FromBytes)]
+#[derive(Debug, Clone, Copy, Default, AsBytes, FromZeroes, FromBytes)]
 #[repr(C)]
 struct virtio_pvclock_config {
     // Number of nanoseconds the VM has been suspended without guest suspension.
@@ -84,7 +85,7 @@ struct virtio_pvclock_config {
     padding: u32,
 }
 
-#[derive(Debug, Clone, Copy, Default, FromBytes, AsBytes)]
+#[derive(Debug, Clone, Copy, Default, FromZeroes, FromBytes, AsBytes)]
 #[repr(C)]
 struct virtio_pvclock_set_pvclock_page_req {
     // Physical address of pvclock page.
@@ -393,10 +394,11 @@ impl PvClockWorker {
             warn!("Suspend time already set, ignoring new suspend time");
             return;
         }
-        // Safe because _rdtsc takes no arguments, and we trust _rdtsc to not modify any other
-        // memory.
         self.suspend_time = Some(PvclockInstant {
             time: Utc::now(),
+            // SAFETY:
+            // Safe because _rdtsc takes no arguments, and we trust _rdtsc to not modify any other
+            // memory.
             tsc_value: unsafe { _rdtsc() },
         });
     }
@@ -447,10 +449,11 @@ impl PvClockWorker {
     fn set_suspended_time(&mut self) -> Result<()> {
         let (this_suspend_duration, this_suspend_tsc_delta) =
             if let Some(suspend_time) = self.suspend_time.take() {
-                // Safe because _rdtsc takes no arguments, and we trust _rdtsc to not modify any
-                // other memory.
                 (
                     Self::get_suspended_duration(&suspend_time),
+                    // SAFETY:
+                    // Safe because _rdtsc takes no arguments, and we trust _rdtsc to not modify any
+                    // other memory.
                     unsafe { _rdtsc() } - suspend_time.tsc_value,
                 )
             } else {
@@ -781,7 +784,7 @@ impl VirtioDevice for PvClock {
         Ok(())
     }
 
-    fn virtio_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(PvClockSnapshot {
             features: self.features,
             acked_features: self.acked_features,
@@ -820,13 +823,11 @@ impl VirtioDevice for PvClock {
 mod tests {
     use super::*;
     use crate::virtio::QueueConfig;
-    use crate::virtio::VIRTIO_MSI_NO_VECTOR;
-    use crate::IrqLevelEvent;
 
     const TEST_QUEUE_SIZE: u16 = 2048;
 
     fn make_interrupt() -> Interrupt {
-        Interrupt::new(IrqLevelEvent::new().unwrap(), None, VIRTIO_MSI_NO_VECTOR)
+        Interrupt::new_for_test()
     }
 
     fn create_sleeping_device() -> (PvClock, GuestMemory, Tube) {

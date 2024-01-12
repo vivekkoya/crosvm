@@ -12,8 +12,6 @@ edition = "2021"
 
 [features]
 default = []
-vmm = []
-device = []
 
 [dependencies]
 anyhow = "*"
@@ -26,7 +24,7 @@ libc = ">=0.2.39"
 remain = "*"
 tempfile = "*"
 thiserror = { version = "1.0.20" }
-zerocopy = "0.6"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 [target.'cfg(windows)'.dependencies]
 serde = { version = "1", features = [ "derive" ] }

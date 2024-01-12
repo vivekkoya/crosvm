@@ -9,14 +9,16 @@ use base::debug;
 use base::error;
 use usb_util::EndpointDirection;
 use usb_util::EndpointType;
-use usb_util::Transfer;
 use usb_util::TransferBuffer;
 use usb_util::TransferStatus;
 use usb_util::ENDPOINT_DIRECTION_OFFSET;
 
 use crate::usb::backend::device::BackendDevice;
-use crate::usb::backend::error::*;
-use crate::usb::backend::utils::submit_transfer;
+use crate::usb::backend::device::BackendDeviceType;
+use crate::usb::backend::error::Error;
+use crate::usb::backend::error::Result;
+use crate::usb::backend::transfer::BackendTransfer;
+use crate::usb::backend::transfer::BackendTransferType;
 use crate::usb::backend::utils::update_transfer_state;
 use crate::usb::xhci::scatter_gather_buffer::ScatterGatherBuffer;
 use crate::usb::xhci::xhci_transfer::TransferDirection;
@@ -25,6 +27,16 @@ use crate::usb::xhci::xhci_transfer::XhciTransferState;
 use crate::usb::xhci::xhci_transfer::XhciTransferType;
 use crate::utils::AsyncJobQueue;
 use crate::utils::FailHandle;
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum ControlEndpointState {
+    /// Control endpoint should receive setup stage next.
+    SetupStage,
+    /// Control endpoint should receive data stage next.
+    DataStage,
+    /// Control endpoint should receive status stage next.
+    StatusStage,
+}
 
 /// Isochronous, Bulk or Interrupt endpoint.
 pub struct UsbEndpoint {
@@ -70,7 +82,7 @@ impl UsbEndpoint {
     /// Handle a xhci transfer.
     pub fn handle_transfer(
         &self,
-        device: &mut impl BackendDevice,
+        device: &mut BackendDeviceType,
         transfer: XhciTransfer,
     ) -> Result<()> {
         let buffer = match transfer
@@ -110,7 +122,7 @@ impl UsbEndpoint {
     fn get_transfer_buffer(
         &self,
         buffer: &ScatterGatherBuffer,
-        device: &mut impl BackendDevice,
+        device: &mut BackendDeviceType,
     ) -> Result<TransferBuffer> {
         let len = buffer.len().map_err(Error::BufferLen)?;
         let mut buf = device.request_transfer_buffer(len);
@@ -136,37 +148,35 @@ impl UsbEndpoint {
 
     fn handle_bulk_transfer(
         &self,
-        device: &mut impl BackendDevice,
+        device: &mut BackendDeviceType,
         xhci_transfer: XhciTransfer,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
         let transfer_buffer = self.get_transfer_buffer(&buffer, device)?;
-        let usb_transfer = Transfer::new_bulk(
+        let usb_transfer = device.build_bulk_transfer(
             self.ep_addr(),
             transfer_buffer,
             xhci_transfer.get_stream_id(),
-        )
-        .map_err(Error::CreateTransfer)?;
+        )?;
         self.do_handle_transfer(device, xhci_transfer, usb_transfer, buffer)
     }
 
     fn handle_interrupt_transfer(
         &self,
-        device: &mut impl BackendDevice,
+        device: &mut BackendDeviceType,
         xhci_transfer: XhciTransfer,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
         let transfer_buffer = self.get_transfer_buffer(&buffer, device)?;
-        let usb_transfer = Transfer::new_interrupt(self.ep_addr(), transfer_buffer)
-            .map_err(Error::CreateTransfer)?;
+        let usb_transfer = device.build_interrupt_transfer(self.ep_addr(), transfer_buffer)?;
         self.do_handle_transfer(device, xhci_transfer, usb_transfer, buffer)
     }
 
     fn do_handle_transfer(
         &self,
-        device: &mut impl BackendDevice,
+        device: &mut BackendDeviceType,
         xhci_transfer: XhciTransfer,
-        mut usb_transfer: Transfer,
+        mut usb_transfer: BackendTransferType,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
         let xhci_transfer = Arc::new(xhci_transfer);
@@ -179,8 +189,8 @@ impl UsbEndpoint {
                     self.ep_addr(),
                     buffer.len()
                 );
-                let callback = move |t: Transfer| {
-                    update_transfer_state(&xhci_transfer, &t)?;
+                let callback = move |t: BackendTransferType| {
+                    update_transfer_state(&xhci_transfer, t.status())?;
                     let state = xhci_transfer.state().lock();
                     match *state {
                         XhciTransferState::Cancelled => {
@@ -205,18 +215,17 @@ impl UsbEndpoint {
                     }
                 };
                 let fail_handle = self.fail_handle.clone();
-                usb_transfer.set_callback(move |t: Transfer| match callback(t) {
+                usb_transfer.set_callback(move |t: BackendTransferType| match callback(t) {
                     Ok(_) => {}
                     Err(e) => {
                         error!("bulk transfer callback failed: {:?}", e);
                         fail_handle.fail();
                     }
                 });
-                submit_transfer(
+                device.submit_transfer(
                     self.fail_handle.clone(),
                     &self.job_queue,
                     tmp_transfer,
-                    device,
                     usb_transfer,
                 )?;
             }
@@ -228,8 +237,8 @@ impl UsbEndpoint {
                     buffer.len()
                 );
                 let _addr = self.ep_addr();
-                let callback = move |t: Transfer| {
-                    update_transfer_state(&xhci_transfer, &t)?;
+                let callback = move |t: BackendTransferType| {
+                    update_transfer_state(&xhci_transfer, t.status())?;
                     let state = xhci_transfer.state().lock();
                     match *state {
                         XhciTransferState::Cancelled => {
@@ -242,7 +251,7 @@ impl UsbEndpoint {
                         XhciTransferState::Completed => {
                             let status = t.status();
                             let actual_length = t.actual_length();
-                            let copied_length = match t.buffer {
+                            let copied_length = match t.buffer() {
                                 TransferBuffer::Vector(v) => {
                                     buffer.write(v.as_slice()).map_err(Error::WriteBuffer)?
                                 }
@@ -272,7 +281,7 @@ impl UsbEndpoint {
                 };
                 let fail_handle = self.fail_handle.clone();
 
-                usb_transfer.set_callback(move |t: Transfer| match callback(t) {
+                usb_transfer.set_callback(move |t: BackendTransferType| match callback(t) {
                     Ok(_) => {}
                     Err(e) => {
                         error!("bulk transfer callback {:?}", e);
@@ -280,11 +289,10 @@ impl UsbEndpoint {
                     }
                 });
 
-                submit_transfer(
+                device.submit_transfer(
                     self.fail_handle.clone(),
                     &self.job_queue,
                     tmp_transfer,
-                    device,
                     usb_transfer,
                 )?;
             }

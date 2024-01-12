@@ -15,18 +15,19 @@ use std::sync::Arc;
 use anyhow::Context;
 use base::FileReadWriteAtVolatile;
 use base::FileReadWriteVolatile;
+use base::VolatileSlice;
 use cros_async::MemRegion;
 use cros_async::MemRegionIter;
 use data_model::Le16;
 use data_model::Le32;
 use data_model::Le64;
-use data_model::VolatileSlice;
 use disk::AsyncDisk;
 use smallvec::SmallVec;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use super::DescriptorChain;
 use crate::virtio::SplitDescriptorChain;
@@ -97,8 +98,8 @@ impl DescriptorChainRegions {
             .collect()
     }
 
-    /// Like 'get_remaining_with_count' except convert the offsets to volatile slices in the
-    /// 'GuestMemory' given by 'mem'.
+    /// Like 'get_remaining_regions_with_count' except convert the offsets to volatile slices in
+    /// the 'GuestMemory' given by 'mem'.
     fn get_remaining_with_count<'mem>(
         &self,
         mem: &'mem GuestMemory,
@@ -737,6 +738,7 @@ impl io::Write for Writer {
             }
 
             let count = cmp::min(rem.len(), b.size());
+            // SAFETY:
             // Safe because we have already verified that `vs` points to valid memory.
             unsafe {
                 copy_nonoverlapping(rem.as_ptr(), b.as_mut_ptr(), count);
@@ -764,7 +766,7 @@ pub enum DescriptorType {
     Writable,
 }
 
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
 #[repr(C)]
 struct virtq_desc {
     addr: Le64,
@@ -1301,7 +1303,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let reader = &mut chain.reader;
 
-        let mut buf = vec![0u8; 64];
+        let mut buf = [0u8; 64];
         assert_eq!(
             reader.read(&mut buf[..]).expect("failed to read to buffer"),
             48
@@ -1325,7 +1327,7 @@ mod tests {
         .expect("create_descriptor_chain failed");
         let writer = &mut chain.writer;
 
-        let buf = vec![0xdeu8; 64];
+        let buf = [0xdeu8; 64];
         assert_eq!(
             writer.write(&buf[..]).expect("failed to write from buffer"),
             48

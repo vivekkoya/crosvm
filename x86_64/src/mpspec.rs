@@ -9,6 +9,7 @@
 // manually added, needs to be included when this crate gets automated bindgen
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 pub const MPC_SIGNATURE: &'static [u8; 5usize] = b"PCMP\x00";
 pub const MP_PROCESSOR: ::std::os::raw::c_uint = 0;
@@ -48,7 +49,7 @@ pub const MP_LEVEL_TRIGGER: ::std::os::raw::c_uint = 0xc;
 pub const MP_APIC_ALL: ::std::os::raw::c_uint = 255;
 pub const MPC_OEM_SIGNATURE: &'static [u8; 5usize] = b"_OEM\x00";
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpf_intel {
     pub signature: [::std::os::raw::c_char; 4usize],
     pub physptr: ::std::os::raw::c_uint,
@@ -74,6 +75,7 @@ fn bindgen_test_layout_mpf_intel() {
         concat!("Alignment of ", stringify!(mpf_intel))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).signature as *const _ as usize },
         0usize,
         concat!(
@@ -84,6 +86,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).physptr as *const _ as usize },
         4usize,
         concat!(
@@ -94,6 +97,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).length as *const _ as usize },
         8usize,
         concat!(
@@ -104,6 +108,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).specification as *const _ as usize },
         9usize,
         concat!(
@@ -114,6 +119,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).checksum as *const _ as usize },
         10usize,
         concat!(
@@ -124,6 +130,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).feature1 as *const _ as usize },
         11usize,
         concat!(
@@ -134,6 +141,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).feature2 as *const _ as usize },
         12usize,
         concat!(
@@ -144,6 +152,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).feature3 as *const _ as usize },
         13usize,
         concat!(
@@ -154,6 +163,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).feature4 as *const _ as usize },
         14usize,
         concat!(
@@ -164,6 +174,7 @@ fn bindgen_test_layout_mpf_intel() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpf_intel)).feature5 as *const _ as usize },
         15usize,
         concat!(
@@ -180,7 +191,7 @@ impl Clone for mpf_intel {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_table {
     pub signature: [::std::os::raw::c_char; 4usize],
     pub length: ::std::os::raw::c_ushort,
@@ -207,6 +218,7 @@ fn bindgen_test_layout_mpc_table() {
         concat!("Alignment of ", stringify!(mpc_table))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).signature as *const _ as usize },
         0usize,
         concat!(
@@ -217,6 +229,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).length as *const _ as usize },
         4usize,
         concat!(
@@ -227,6 +240,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).spec as *const _ as usize },
         6usize,
         concat!(
@@ -237,6 +251,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).checksum as *const _ as usize },
         7usize,
         concat!(
@@ -247,6 +262,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).oem as *const _ as usize },
         8usize,
         concat!(
@@ -257,6 +273,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).productid as *const _ as usize },
         16usize,
         concat!(
@@ -267,6 +284,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).oemptr as *const _ as usize },
         28usize,
         concat!(
@@ -277,6 +295,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).oemsize as *const _ as usize },
         32usize,
         concat!(
@@ -287,6 +306,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).oemcount as *const _ as usize },
         34usize,
         concat!(
@@ -297,6 +317,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).lapic as *const _ as usize },
         36usize,
         concat!(
@@ -307,6 +328,7 @@ fn bindgen_test_layout_mpc_table() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_table)).reserved as *const _ as usize },
         40usize,
         concat!(
@@ -323,7 +345,7 @@ impl Clone for mpc_table {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_cpu {
     pub type_: ::std::os::raw::c_uchar,
     pub apicid: ::std::os::raw::c_uchar,
@@ -346,6 +368,7 @@ fn bindgen_test_layout_mpc_cpu() {
         concat!("Alignment of ", stringify!(mpc_cpu))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).type_ as *const _ as usize },
         0usize,
         concat!(
@@ -356,6 +379,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).apicid as *const _ as usize },
         1usize,
         concat!(
@@ -366,6 +390,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).apicver as *const _ as usize },
         2usize,
         concat!(
@@ -376,6 +401,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).cpuflag as *const _ as usize },
         3usize,
         concat!(
@@ -386,6 +412,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).cpufeature as *const _ as usize },
         4usize,
         concat!(
@@ -396,6 +423,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).featureflag as *const _ as usize },
         8usize,
         concat!(
@@ -406,6 +434,7 @@ fn bindgen_test_layout_mpc_cpu() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_cpu)).reserved as *const _ as usize },
         12usize,
         concat!(
@@ -422,7 +451,7 @@ impl Clone for mpc_cpu {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_bus {
     pub type_: ::std::os::raw::c_uchar,
     pub busid: ::std::os::raw::c_uchar,
@@ -441,6 +470,7 @@ fn bindgen_test_layout_mpc_bus() {
         concat!("Alignment of ", stringify!(mpc_bus))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_bus)).type_ as *const _ as usize },
         0usize,
         concat!(
@@ -451,6 +481,7 @@ fn bindgen_test_layout_mpc_bus() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_bus)).busid as *const _ as usize },
         1usize,
         concat!(
@@ -461,6 +492,7 @@ fn bindgen_test_layout_mpc_bus() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_bus)).bustype as *const _ as usize },
         2usize,
         concat!(
@@ -477,7 +509,7 @@ impl Clone for mpc_bus {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_ioapic {
     pub type_: ::std::os::raw::c_uchar,
     pub apicid: ::std::os::raw::c_uchar,
@@ -498,6 +530,7 @@ fn bindgen_test_layout_mpc_ioapic() {
         concat!("Alignment of ", stringify!(mpc_ioapic))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_ioapic)).type_ as *const _ as usize },
         0usize,
         concat!(
@@ -508,6 +541,7 @@ fn bindgen_test_layout_mpc_ioapic() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_ioapic)).apicid as *const _ as usize },
         1usize,
         concat!(
@@ -518,6 +552,7 @@ fn bindgen_test_layout_mpc_ioapic() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_ioapic)).apicver as *const _ as usize },
         2usize,
         concat!(
@@ -528,6 +563,7 @@ fn bindgen_test_layout_mpc_ioapic() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_ioapic)).flags as *const _ as usize },
         3usize,
         concat!(
@@ -538,6 +574,7 @@ fn bindgen_test_layout_mpc_ioapic() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_ioapic)).apicaddr as *const _ as usize },
         4usize,
         concat!(
@@ -554,7 +591,7 @@ impl Clone for mpc_ioapic {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_intsrc {
     pub type_: ::std::os::raw::c_uchar,
     pub irqtype: ::std::os::raw::c_uchar,
@@ -577,6 +614,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         concat!("Alignment of ", stringify!(mpc_intsrc))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).type_ as *const _ as usize },
         0usize,
         concat!(
@@ -587,6 +625,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).irqtype as *const _ as usize },
         1usize,
         concat!(
@@ -597,6 +636,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).irqflag as *const _ as usize },
         2usize,
         concat!(
@@ -607,6 +647,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).srcbus as *const _ as usize },
         4usize,
         concat!(
@@ -617,6 +658,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).srcbusirq as *const _ as usize },
         5usize,
         concat!(
@@ -627,6 +669,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).dstapic as *const _ as usize },
         6usize,
         concat!(
@@ -637,6 +680,7 @@ fn bindgen_test_layout_mpc_intsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_intsrc)).dstirq as *const _ as usize },
         7usize,
         concat!(
@@ -658,7 +702,7 @@ pub const mp_irq_source_types_mp_SMI: mp_irq_source_types = 2;
 pub const mp_irq_source_types_mp_ExtINT: mp_irq_source_types = 3;
 pub type mp_irq_source_types = ::std::os::raw::c_uint;
 #[repr(C)]
-#[derive(Debug, Default, Copy, FromBytes, AsBytes)]
+#[derive(Debug, Default, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct mpc_lintsrc {
     pub type_: ::std::os::raw::c_uchar,
     pub irqtype: ::std::os::raw::c_uchar,
@@ -681,6 +725,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         concat!("Alignment of ", stringify!(mpc_lintsrc))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).type_ as *const _ as usize },
         0usize,
         concat!(
@@ -691,6 +736,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).irqtype as *const _ as usize },
         1usize,
         concat!(
@@ -701,6 +747,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).irqflag as *const _ as usize },
         2usize,
         concat!(
@@ -711,6 +758,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).srcbusid as *const _ as usize },
         4usize,
         concat!(
@@ -721,6 +769,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).srcbusirq as *const _ as usize },
         5usize,
         concat!(
@@ -731,6 +780,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).destapic as *const _ as usize },
         6usize,
         concat!(
@@ -741,6 +791,7 @@ fn bindgen_test_layout_mpc_lintsrc() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_lintsrc)).destapiclint as *const _ as usize },
         7usize,
         concat!(
@@ -778,6 +829,7 @@ fn bindgen_test_layout_mpc_oemtable() {
         concat!("Alignment of ", stringify!(mpc_oemtable))
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_oemtable)).signature as *const _ as usize },
         0usize,
         concat!(
@@ -788,6 +840,7 @@ fn bindgen_test_layout_mpc_oemtable() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_oemtable)).length as *const _ as usize },
         4usize,
         concat!(
@@ -798,6 +851,7 @@ fn bindgen_test_layout_mpc_oemtable() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_oemtable)).rev as *const _ as usize },
         6usize,
         concat!(
@@ -808,6 +862,7 @@ fn bindgen_test_layout_mpc_oemtable() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_oemtable)).checksum as *const _ as usize },
         7usize,
         concat!(
@@ -818,6 +873,7 @@ fn bindgen_test_layout_mpc_oemtable() {
         )
     );
     assert_eq!(
+        // SAFETY: trivially safe
         unsafe { &(*(0 as *const mpc_oemtable)).mpc as *const _ as usize },
         8usize,
         concat!(

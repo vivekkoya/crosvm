@@ -56,6 +56,7 @@ use thiserror::Error as ThisError;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::virtio::async_utils;
 use crate::virtio::copy_config;
@@ -150,6 +151,9 @@ pub struct Vsock {
     /// Stores any active connections when the device sleeps. This allows us to sleep/wake
     /// without disrupting active connections, which is useful when taking a snapshot.
     sleeping_connections: Option<VsockConnectionMap>,
+    /// If true, we should send a TRANSPORT_RESET event to the guest at the next opportunity.
+    /// Used to inform the guest all connections are broken when we restore a snapshot.
+    needs_transport_reset: bool,
 }
 
 /// Snapshotted state of Vsock. These fields are serialized in order to validate they haven't
@@ -170,6 +174,7 @@ impl Vsock {
             acked_features: 0,
             worker_thread: None,
             sleeping_connections: None,
+            needs_transport_reset: false,
         })
     }
 
@@ -204,11 +209,19 @@ impl Vsock {
 
         let host_guid = self.host_guid.clone();
         let guest_cid = self.guest_cid;
+        let needs_transport_reset = self.needs_transport_reset;
+        self.needs_transport_reset = false;
         self.worker_thread = Some(WorkerThread::start(
             "userspace_virtio_vsock",
             move |kill_evt| {
-                let mut worker =
-                    Worker::new(mem, interrupt, host_guid, guest_cid, existing_connections);
+                let mut worker = Worker::new(
+                    mem,
+                    interrupt,
+                    host_guid,
+                    guest_cid,
+                    existing_connections,
+                    needs_transport_reset,
+                );
                 let result = worker.run(rx_queue, tx_queue, event_queue, kill_evt);
 
                 match result {
@@ -310,7 +323,7 @@ impl VirtioDevice for Vsock {
         Ok(())
     }
 
-    fn virtio_snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn virtio_snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(VsockSnapshot {
             guest_cid: self.guest_cid,
             features: self.features,
@@ -335,6 +348,7 @@ impl VirtioDevice for Vsock {
             vsock_snapshot.features
         );
         self.acked_features = vsock_snapshot.acked_features;
+        self.needs_transport_reset = true;
 
         Ok(())
     }
@@ -412,6 +426,9 @@ struct Worker {
     // Map of host port to a VsockConnection.
     connections: VsockConnectionMap,
     connection_event: Event,
+    device_event_queue_tx: mpsc::Sender<virtio_vsock_event>,
+    device_event_queue_rx: Option<mpsc::Receiver<virtio_vsock_event>>,
+    send_protocol_reset: bool,
 }
 
 impl Worker {
@@ -421,7 +438,15 @@ impl Worker {
         host_guid: Option<String>,
         guest_cid: u64,
         existing_connections: Option<VsockConnectionMap>,
+        send_protocol_reset: bool,
     ) -> Worker {
+        // Buffer size here is arbitrary, but must be at least one since we need
+        // to be able to write a reset event to the channel when the device
+        // worker is brought up on a VM restore. Note that we send exactly one
+        // message per VM session, so we should never see these messages backing
+        // up.
+        let (device_event_queue_tx, device_event_queue_rx) = mpsc::channel(4);
+
         Worker {
             mem,
             interrupt,
@@ -429,6 +454,9 @@ impl Worker {
             guest_cid,
             connections: existing_connections.unwrap_or_default(),
             connection_event: Event::new().unwrap(),
+            device_event_queue_tx,
+            device_event_queue_rx: Some(device_event_queue_rx),
+            send_protocol_reset,
         }
     }
 
@@ -622,6 +650,7 @@ impl Worker {
                 // Start reading again so we receive the message and
                 // event signal immediately.
 
+                // SAFETY:
                 // Unsafe because the read could happen at any time
                 // after this function is called. We ensure safety
                 // by allocating the buffer and overlapped struct
@@ -699,7 +728,7 @@ impl Worker {
     }
 
     fn calculate_buf_alloc_from_pipe(pipe: &PipeConnection, port: PortPair) -> usize {
-        match pipe.get_info(/* is_server_connection= */ false) {
+        match pipe.get_info() {
             Ok(info) => {
                 if info.outgoing_buffer_size > 0 {
                     info.outgoing_buffer_size as usize
@@ -731,12 +760,12 @@ impl Worker {
     /// (false).
     async fn handle_vsock_connection_request(&self, header: virtio_vsock_hdr) -> bool {
         let port = PortPair::from_tx_header(&header);
-        info!("vsock: Received connection request for port {}", port);
+        info!("vsock: port {}: Received connection request", port);
 
         if self.connections.read_lock().await.contains_key(&port) {
             // Connection exists, nothing for us to do.
             warn!(
-                "vsock: accepting connection request on already connected port {}",
+                "vsock: port {}: accepting connection request on already connected port",
                 port
             );
             return true;
@@ -744,8 +773,9 @@ impl Worker {
 
         if self.host_guid.is_none() {
             error!(
-                "vsock: Cannot accept guest-initiated connections \
-                        without host-guid, rejecting connection"
+                "vsock: port {}: Cannot accept guest-initiated connections \
+                        without host-guid, rejecting connection",
+                port,
             );
             return false;
         }
@@ -767,7 +797,9 @@ impl Worker {
         match pipe_result {
             Ok(mut pipe_connection) => {
                 let mut buffer = Box::new([0u8; TEMP_READ_BUF_SIZE_BYTES]);
+                info!("vsock: port {}: created client pipe", port);
 
+                // SAFETY:
                 // Unsafe because the read could happen at any time
                 // after this function is called. We ensure safety
                 // by allocating the buffer and overlapped struct
@@ -782,6 +814,7 @@ impl Worker {
                         }
                     }
                 }
+                info!("vsock: port {}: started read on client pipe", port);
 
                 let buf_alloc = Self::calculate_buf_alloc_from_pipe(&pipe_connection, port);
                 let connection = VsockConnection {
@@ -806,6 +839,7 @@ impl Worker {
                         port
                     )
                 });
+                info!("vsock: port {}: signaled connection ready", port);
                 true
             }
             Err(e) => {
@@ -974,7 +1008,10 @@ impl Worker {
                     });
                     // Try to send the packet. Do not block other ports if the queue is full.
                     if let Err(e) = queue.try_send(packet) {
-                        error!("Error sending packet to queue, dropping packet: {:?}", e)
+                        error!(
+                            "vsock: port {}: error sending packet to queue, dropping packet: {:?}",
+                            port, e
+                        )
                     }
                 }
                 SelectResult::Finished(_) => {
@@ -1081,6 +1118,15 @@ impl Worker {
                 )
                 .await
                 .expect("vsock: failed to write to queue");
+                info!(
+                    "vsock: port {}: replied {} to connection request",
+                    port,
+                    if resp_op == vsock_op::VIRTIO_VSOCK_OP_RESPONSE {
+                        "success"
+                    } else {
+                        "reset"
+                    },
+                );
             }
             vsock_op::VIRTIO_VSOCK_OP_RESPONSE => {
                 // TODO(b/237811512): Implement this for host-initiated connections
@@ -1163,21 +1209,24 @@ impl Worker {
                     connection.peer_recv_cnt = header.fwd_cnt.to_native() as usize;
                     connection.peer_buf_alloc = header.buf_alloc.to_native() as usize;
                 } else {
-                    error!("vsock: got credit update on unknown port {}", port);
+                    error!("vsock: port {}: got credit update on unknown port", port);
                     is_open = false;
                 }
             }
             // A request from our peer to get *our* buffer state. We reply to the RX queue.
             vsock_op::VIRTIO_VSOCK_OP_CREDIT_REQUEST => {
                 info!(
-                    "vsock: Got credit request from peer {}; sending credit update.",
+                    "vsock: port {}: Got credit request from peer; sending credit update.",
                     port,
                 );
                 self.send_vsock_credit_update(send_queue, rx_queue_evt, header)
                     .await;
             }
             _ => {
-                error!("vsock: Unknown operation requested, dropping packet");
+                error!(
+                    "vsock: port {}: unknown operation requested, dropping packet",
+                    port
+                );
             }
         }
         is_open
@@ -1227,10 +1276,10 @@ impl Worker {
                 response.as_bytes_mut(),
             )
             .await
-            .expect("vsock: failed to write to queue");
+            .unwrap_or_else(|_| panic!("vsock: port {}: failed to write to queue", port));
         } else {
             error!(
-                "vsock: error sending credit update on unknown port {}",
+                "vsock: port {}: error sending credit update on unknown port",
                 port
             );
         }
@@ -1268,7 +1317,7 @@ impl Worker {
             .await
             .expect("failed to write to queue");
         } else {
-            error!("vsock: error closing unknown port {}", port);
+            error!("vsock: port {}: error closing unknown port", port);
         }
     }
 
@@ -1281,12 +1330,40 @@ impl Worker {
         let mut avail_desc = match queue.next_async(queue_evt).await {
             Ok(d) => d,
             Err(e) => {
-                error!("vsock: Failed to read descriptor {}", e);
+                error!("vsock: failed to read descriptor {}", e);
                 return Err(VsockError::AwaitQueue(e));
             }
         };
+        self.write_bytes_to_queue_inner(queue, avail_desc, bytes)
+    }
 
-        let writer = &mut avail_desc.writer;
+    async fn write_bytes_to_queue_interruptable(
+        &self,
+        queue: &mut Queue,
+        queue_evt: &mut EventAsync,
+        bytes: &[u8],
+        mut stop_rx: &mut oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let mut avail_desc = match queue.next_async_interruptable(queue_evt, stop_rx).await {
+            Ok(d) => match d {
+                Some(desc) => desc,
+                None => return Ok(()),
+            },
+            Err(e) => {
+                error!("vsock: failed to read descriptor {}", e);
+                return Err(VsockError::AwaitQueue(e));
+            }
+        };
+        self.write_bytes_to_queue_inner(queue, avail_desc, bytes)
+    }
+
+    fn write_bytes_to_queue_inner(
+        &self,
+        queue: &mut Queue,
+        mut desc_chain: DescriptorChain,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let writer = &mut desc_chain.writer;
         let res = writer.write_all(bytes);
 
         if let Err(e) = res {
@@ -1300,11 +1377,11 @@ impl Worker {
 
         let bytes_written = writer.bytes_written() as u32;
         if bytes_written > 0 {
-            queue.add_used(avail_desc, bytes_written);
+            queue.add_used(desc_chain, bytes_written);
             queue.trigger_interrupt(&self.interrupt);
             Ok(())
         } else {
-            error!("vsock: Failed to write bytes to queue");
+            error!("vsock: failed to write bytes to queue");
             Err(VsockError::WriteQueue(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "failed to write bytes to queue",
@@ -1317,36 +1394,34 @@ impl Worker {
         mut queue: Queue,
         mut queue_evt: EventAsync,
         mut stop_rx: oneshot::Receiver<()>,
+        mut vsock_event_receiver: mpsc::Receiver<virtio_vsock_event>,
     ) -> Result<Queue> {
         loop {
-            // Log but don't act on events. They are reserved exclusively for guest migration events
-            // resulting in CID resets, which we don't support.
-            let mut avail_desc = match queue
-                .next_async_interruptable(&mut queue_evt, &mut stop_rx)
-                .await
-            {
-                Ok(Some(d)) => d,
-                Ok(None) => break,
-                Err(e) => {
-                    error!("vsock: Failed to read descriptor {}", e);
-                    return Err(VsockError::AwaitQueue(e));
+            let vsock_event = select_biased! {
+                vsock_event = vsock_event_receiver.next() => {
+                    vsock_event
+                }
+                _ = stop_rx => {
+                    break;
                 }
             };
-
-            for event in avail_desc.reader.iter::<virtio_vsock_event>() {
-                if event.is_ok() {
-                    error!(
-                        "Received event with id {:?}, this should not happen, and will not be handled",
-                        event.unwrap().id.to_native()
-                    );
-                }
-            }
+            let vsock_event = match vsock_event {
+                Some(event) => event,
+                None => break,
+            };
+            self.write_bytes_to_queue_interruptable(
+                &mut queue,
+                &mut queue_evt,
+                vsock_event.as_bytes(),
+                &mut stop_rx,
+            )
+            .await?;
         }
         Ok(queue)
     }
 
     fn run(
-        self,
+        mut self,
         rx_queue: Queue,
         tx_queue: Queue,
         event_queue: Queue,
@@ -1375,6 +1450,11 @@ impl Worker {
             )
             .expect("Failed to set up the rx queue event");
             let mut stop_queue_oneshots = Vec::new();
+
+            let vsock_event_receiver = self
+                .device_event_queue_rx
+                .take()
+                .expect("event queue rx must be present");
 
             let stop_rx = create_stop_oneshot(&mut stop_queue_oneshots);
             let rx_handler =
@@ -1412,7 +1492,12 @@ impl Worker {
             )
             .expect("Failed to set up the event queue event");
             let stop_rx = create_stop_oneshot(&mut stop_queue_oneshots);
-            let event_handler = self.process_event_queue(event_queue, event_evt_async, stop_rx);
+            let event_handler = self.process_event_queue(
+                event_queue,
+                event_evt_async,
+                stop_rx,
+                vsock_event_receiver,
+            );
             let event_handler = event_handler.fuse();
             pin_mut!(event_handler);
 
@@ -1424,6 +1509,16 @@ impl Worker {
             let kill_evt = EventAsync::new(kill_evt, &ex).expect("Failed to set up the kill event");
             let kill_handler = kill_evt.next_val();
             pin_mut!(kill_handler);
+
+            let mut device_event_queue_tx = self.device_event_queue_tx.clone();
+            if self.send_protocol_reset {
+                ex.run_until(async move { device_event_queue_tx.send(
+                   virtio_vsock_event {
+                       id: virtio_sys::virtio_vsock::virtio_vsock_event_id_VIRTIO_VSOCK_EVENT_TRANSPORT_RESET
+                           .into(),
+                   }).await
+                }).expect("failed to write to empty mpsc queue.");
+            }
 
             ex.run_until(async {
                 select! {

@@ -8,6 +8,7 @@ use bitflags::bitflags;
 use enumn::N;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 /// Version number of this interface.
 pub const KERNEL_VERSION: u32 = 7;
@@ -53,19 +54,22 @@ bitflags! {
 // Flags returned by the OPEN request.
 
 /// Bypass page cache for this open file.
-const FOPEN_DIRECT_IO: u32 = 1;
+const FOPEN_DIRECT_IO: u32 = 1 << 0;
 
 /// Don't invalidate the data cache on open.
-const FOPEN_KEEP_CACHE: u32 = 2;
+const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 /// The file is not seekable.
-const FOPEN_NONSEEKABLE: u32 = 4;
+const FOPEN_NONSEEKABLE: u32 = 1 << 2;
 
 /// Allow caching the directory entries.
-const FOPEN_CACHE_DIR: u32 = 8;
+const FOPEN_CACHE_DIR: u32 = 1 << 3;
 
 /// This file is stream-like (i.e., no file position).
-const FOPEN_STREAM: u32 = 16;
+const FOPEN_STREAM: u32 = 1 << 4;
+
+/// New file was created in atomic open
+const FOPEN_FILE_CREATED: u32 = 1 << 7;
 
 bitflags! {
     /// Options controlling the behavior of files opened by the server in response
@@ -78,98 +82,106 @@ bitflags! {
         const NONSEEKABLE = FOPEN_NONSEEKABLE;
         const CACHE_DIR = FOPEN_CACHE_DIR;
         const STREAM = FOPEN_STREAM;
+        const FILE_CREATED = FOPEN_FILE_CREATED;
     }
 }
 
 // INIT request/reply flags.
 
 /// Asynchronous read requests.
-const ASYNC_READ: u32 = 1;
+const ASYNC_READ: u64 = 1;
 
 /// Remote locking for POSIX file locks.
-const POSIX_LOCKS: u32 = 2;
+const POSIX_LOCKS: u64 = 2;
 
 /// Kernel sends file handle for fstat, etc... (not yet supported).
-const FILE_OPS: u32 = 4;
+const FILE_OPS: u64 = 4;
 
 /// Handles the O_TRUNC open flag in the filesystem.
-const ATOMIC_O_TRUNC: u32 = 8;
+const ATOMIC_O_TRUNC: u64 = 8;
 
 /// FileSystem handles lookups of "." and "..".
-const EXPORT_SUPPORT: u32 = 16;
+const EXPORT_SUPPORT: u64 = 16;
 
 /// FileSystem can handle write size larger than 4kB.
-const BIG_WRITES: u32 = 32;
+const BIG_WRITES: u64 = 32;
 
 /// Don't apply umask to file mode on create operations.
-const DONT_MASK: u32 = 64;
+const DONT_MASK: u64 = 64;
 
 /// Kernel supports splice write on the device.
-const SPLICE_WRITE: u32 = 128;
+const SPLICE_WRITE: u64 = 128;
 
 /// Kernel supports splice move on the device.
-const SPLICE_MOVE: u32 = 256;
+const SPLICE_MOVE: u64 = 256;
 
 /// Kernel supports splice read on the device.
-const SPLICE_READ: u32 = 512;
+const SPLICE_READ: u64 = 512;
 
 /// Remote locking for BSD style file locks.
-const FLOCK_LOCKS: u32 = 1024;
+const FLOCK_LOCKS: u64 = 1024;
 
 /// Kernel supports ioctl on directories.
-const HAS_IOCTL_DIR: u32 = 2048;
+const HAS_IOCTL_DIR: u64 = 2048;
 
 /// Automatically invalidate cached pages.
-const AUTO_INVAL_DATA: u32 = 4096;
+const AUTO_INVAL_DATA: u64 = 4096;
 
 /// Do READDIRPLUS (READDIR+LOOKUP in one).
-const DO_READDIRPLUS: u32 = 8192;
+const DO_READDIRPLUS: u64 = 8192;
 
 /// Adaptive readdirplus.
-const READDIRPLUS_AUTO: u32 = 16384;
+const READDIRPLUS_AUTO: u64 = 16384;
 
 /// Asynchronous direct I/O submission.
-const ASYNC_DIO: u32 = 32768;
+const ASYNC_DIO: u64 = 32768;
 
 /// Use writeback cache for buffered writes.
-const WRITEBACK_CACHE: u32 = 65536;
+const WRITEBACK_CACHE: u64 = 65536;
 
 /// Kernel supports zero-message opens.
-const NO_OPEN_SUPPORT: u32 = 131072;
+const NO_OPEN_SUPPORT: u64 = 131072;
 
 /// Allow parallel lookups and readdir.
-const PARALLEL_DIROPS: u32 = 262144;
+const PARALLEL_DIROPS: u64 = 262144;
 
 /// Fs handles killing suid/sgid/cap on write/chown/trunc.
-const HANDLE_KILLPRIV: u32 = 524288;
+const HANDLE_KILLPRIV: u64 = 524288;
 
 /// FileSystem supports posix acls.
-const POSIX_ACL: u32 = 1048576;
+const POSIX_ACL: u64 = 1048576;
 
 /// Reading the device after an abort returns `ECONNABORTED`.
-const ABORT_ERROR: u32 = 2097152;
+const ABORT_ERROR: u64 = 2097152;
 
 /// The reply to the `init` message contains the max number of request pages.
-const MAX_PAGES: u32 = 4194304;
+const MAX_PAGES: u64 = 4194304;
 
 /// Cache `readlink` responses.
-const CACHE_SYMLINKS: u32 = 8388608;
+const CACHE_SYMLINKS: u64 = 8388608;
 
 /// Kernel supports zero-message opens for directories.
-const NO_OPENDIR_SUPPORT: u32 = 16777216;
+const NO_OPENDIR_SUPPORT: u64 = 16777216;
 
 /// Kernel supports explicit cache invalidation.
-const EXPLICIT_INVAL_DATA: u32 = 33554432;
+const EXPLICIT_INVAL_DATA: u64 = 33554432;
 
 /// The `map_alignment` field of the `InitOut` struct is valid.
-const MAP_ALIGNMENT: u32 = 67108864;
+const MAP_ALIGNMENT: u64 = 67108864;
+
+/// Extended fuse_init_in request to hold additional flags
+const INIT_EXT: u64 = 1073741824;
+
+/// The client should send the security context along with open, mkdir, create, and symlink
+/// requests.
+const SECURITY_CONTEXT: u64 = 4294967296;
 
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
     #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
     #[repr(transparent)]
-    pub struct FsOptions: u32 {
+    pub struct FsOptions: u64 {
         /// Indicates that the filesystem supports asynchronous read requests.
         ///
         /// If this capability is not requested/available, the kernel will ensure that there is at
@@ -371,12 +383,17 @@ bitflags! {
         /// this feature is enabled by default.
         const MAP_ALIGNMENT = MAP_ALIGNMENT;
 
-
         /// Indicates that the `max_pages` field of the `InitOut` struct is valid.
         ///
         /// This field is used by the kernel driver to determine the maximum number of pages that
         /// may be used for any read or write requests.
         const MAX_PAGES = MAX_PAGES;
+
+        /// Indicates that `InitIn`/`InitOut` struct is extended to hold additional flags.
+        const INIT_EXT = INIT_EXT;
+
+        /// Indicates support for sending the security context with creation requests.
+        const SECURITY_CONTEXT = SECURITY_CONTEXT;
     }
 }
 
@@ -479,8 +496,12 @@ bitflags! {
     }
 }
 
+// Request Extension Constants
+/// Maximum security contexts in a request
+pub const MAX_NR_SECCTX: u32 = 31;
+
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Attr {
     pub ino: u64,
     pub size: u64,
@@ -525,7 +546,7 @@ impl From<libc::stat64> for Attr {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Kstatfs {
     pub blocks: u64,
     pub bfree: u64,
@@ -557,7 +578,7 @@ impl From<libc::statvfs64> for Kstatfs {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct FileLock {
     pub start: u64,
     pub end: u64,
@@ -615,6 +636,9 @@ pub enum Opcode {
     CopyFileRange = 47,
     SetUpMapping = 48,
     RemoveMapping = 49,
+    // TODO(b/310102543): Update the opcode keep same with kernel patch after the atomic open
+    // kernel is merged to upstream.
+    OpenAtomic = u32::MAX - 1,
     ChromeOsTmpfile = u32::MAX,
 }
 
@@ -631,7 +655,7 @@ pub enum NotifyOpcode {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct EntryOut {
     pub nodeid: u64,      /* Inode ID */
     pub generation: u64,  /* Inode generation: nodeid:gen must be unique for the fs's lifetime */
@@ -643,27 +667,27 @@ pub struct EntryOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct ForgetIn {
     pub nlookup: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct ForgetOne {
     pub nodeid: u64,
     pub nlookup: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct BatchForgetIn {
     pub count: u32,
     pub dummy: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct GetattrIn {
     pub flags: u32,
     pub dummy: u32,
@@ -671,7 +695,7 @@ pub struct GetattrIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct AttrOut {
     pub attr_valid: u64, /* Cache timeout for the attributes */
     pub attr_valid_nsec: u32,
@@ -680,7 +704,7 @@ pub struct AttrOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct MknodIn {
     pub mode: u32,
     pub rdev: u32,
@@ -689,27 +713,27 @@ pub struct MknodIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct MkdirIn {
     pub mode: u32,
     pub umask: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct ChromeOsTmpfileIn {
     pub mode: u32,
     pub umask: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct RenameIn {
     pub newdir: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Rename2In {
     pub newdir: u64,
     pub flags: u32,
@@ -717,13 +741,13 @@ pub struct Rename2In {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct LinkIn {
     pub oldnodeid: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct SetattrIn {
     pub valid: u32,
     pub padding: u32,
@@ -745,7 +769,7 @@ pub struct SetattrIn {
 
 impl From<SetattrIn> for libc::stat64 {
     fn from(s: SetattrIn) -> libc::stat64 {
-        // Safe because we are zero-initializing a struct with only POD fields.
+        // SAFETY: zero-initializing a struct with only POD fields.
         let mut out: libc::stat64 = unsafe { mem::zeroed() };
         out.st_mode = s.mode;
         out.st_uid = s.uid;
@@ -763,14 +787,14 @@ impl From<SetattrIn> for libc::stat64 {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct OpenIn {
     pub flags: u32,
     pub unused: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct CreateIn {
     pub flags: u32,
     pub mode: u32,
@@ -779,7 +803,7 @@ pub struct CreateIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct OpenOut {
     pub fh: u64,
     pub open_flags: u32,
@@ -787,7 +811,7 @@ pub struct OpenOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct ReleaseIn {
     pub fh: u64,
     pub flags: u32,
@@ -796,7 +820,7 @@ pub struct ReleaseIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct FlushIn {
     pub fh: u64,
     pub unused: u32,
@@ -805,7 +829,7 @@ pub struct FlushIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct ReadIn {
     pub fh: u64,
     pub offset: u64,
@@ -817,7 +841,7 @@ pub struct ReadIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct WriteIn {
     pub fh: u64,
     pub offset: u64,
@@ -829,20 +853,20 @@ pub struct WriteIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct WriteOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct StatfsOut {
     pub st: Kstatfs,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct FsyncIn {
     pub fh: u64,
     pub fsync_flags: u32,
@@ -850,28 +874,28 @@ pub struct FsyncIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct SetxattrIn {
     pub size: u32,
     pub flags: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct GetxattrIn {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct GetxattrOut {
     pub size: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct LkIn {
     pub fh: u64,
     pub owner: u64,
@@ -881,20 +905,20 @@ pub struct LkIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct LkOut {
     pub lk: FileLock,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct AccessIn {
     pub mask: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct InitIn {
     pub major: u32,
     pub minor: u32,
@@ -903,7 +927,14 @@ pub struct InitIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
+pub struct InitInExt {
+    pub flags2: u32,
+    pub unused: [u32; 11],
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct InitOut {
     pub major: u32,
     pub minor: u32,
@@ -915,17 +946,18 @@ pub struct InitOut {
     pub time_gran: u32,
     pub max_pages: u16,
     pub map_alignment: u16,
-    pub unused: [u32; 8],
+    pub flags2: u32,
+    pub unused: [u32; 7],
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct InterruptIn {
     pub unique: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct BmapIn {
     pub block: u64,
     pub blocksize: u32,
@@ -933,13 +965,13 @@ pub struct BmapIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct BmapOut {
     pub block: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct IoctlIn {
     pub fh: u64,
     pub flags: u32,
@@ -952,7 +984,7 @@ pub struct IoctlIn {
 /// Describes a region of memory in the address space of the process that made the ioctl syscall.
 /// Similar to `libc::iovec` but uses `u64`s for the address and the length.
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct IoctlIovec {
     /// The start address of the memory region. This must be in the address space of the process
     /// that made the ioctl syscall.
@@ -963,7 +995,7 @@ pub struct IoctlIovec {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct IoctlOut {
     pub result: i32,
     pub flags: u32,
@@ -972,7 +1004,7 @@ pub struct IoctlOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct PollIn {
     pub fh: u64,
     pub kh: u64,
@@ -981,20 +1013,20 @@ pub struct PollIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct PollOut {
     pub revents: u32,
     pub padding: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyPollWakeupOut {
     pub kh: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct FallocateIn {
     pub fh: u64,
     pub offset: u64,
@@ -1004,7 +1036,7 @@ pub struct FallocateIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct InHeader {
     pub len: u32,
     pub opcode: u32,
@@ -1017,7 +1049,7 @@ pub struct InHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct OutHeader {
     pub len: u32,
     pub error: i32,
@@ -1025,7 +1057,7 @@ pub struct OutHeader {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Dirent {
     pub ino: u64,
     pub off: u64,
@@ -1035,14 +1067,14 @@ pub struct Dirent {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Direntplus {
     pub entry_out: EntryOut,
     pub dirent: Dirent,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyInvalInodeOut {
     pub ino: u64,
     pub off: i64,
@@ -1050,7 +1082,7 @@ pub struct NotifyInvalInodeOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyInvalEntryOut {
     pub parent: u64,
     pub namelen: u32,
@@ -1058,7 +1090,7 @@ pub struct NotifyInvalEntryOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyDeleteOut {
     pub parent: u64,
     pub child: u64,
@@ -1067,7 +1099,7 @@ pub struct NotifyDeleteOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyStoreOut {
     pub nodeid: u64,
     pub offset: u64,
@@ -1076,7 +1108,7 @@ pub struct NotifyStoreOut {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct Notify_Retrieve_Out {
     pub notify_unique: u64,
     pub nodeid: u64,
@@ -1087,7 +1119,7 @@ pub struct Notify_Retrieve_Out {
 
 /* Matches the size of fuse_write_in */
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct NotifyRetrieveIn {
     pub dummy1: u64,
     pub offset: u64,
@@ -1098,7 +1130,7 @@ pub struct NotifyRetrieveIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct LseekIn {
     pub fh: u64,
     pub offset: u64,
@@ -1107,13 +1139,13 @@ pub struct LseekIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct LseekOut {
     pub offset: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct CopyFileRangeIn {
     pub fh_src: u64,
     pub off_src: u64,
@@ -1125,7 +1157,7 @@ pub struct CopyFileRangeIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct SetUpMappingIn {
     /* An already open handle */
     pub fh: u64,
@@ -1140,17 +1172,38 @@ pub struct SetUpMappingIn {
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct RemoveMappingIn {
     /* number of fuse_removemapping_one follows */
     pub count: u32,
 }
 
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone, AsBytes, FromBytes)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
 pub struct RemoveMappingOne {
     /* Offset into the dax window start the unmapping */
     pub moffset: u64,
     /* Length of mapping required */
     pub len: u64,
+}
+
+/// For each security context, send fuse_secctx with size of security context
+/// fuse_secctx will be followed by security context name and this in turn
+/// will be followed by actual context label.
+/// fuse_secctx, name, context
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
+pub struct Secctx {
+    pub size: u32,
+    pub padding: u32,
+}
+
+/// Contains the information about how many fuse_secctx structures are being
+/// sent and what's the total size of all security contexts (including
+/// size of fuse_secctx_header).
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone, AsBytes, FromZeroes, FromBytes)]
+pub struct SecctxHeader {
+    pub size: u32,
+    pub nr_secctx: u32,
 }

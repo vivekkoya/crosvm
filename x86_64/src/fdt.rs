@@ -2,12 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::PathBuf;
 
 use arch::android::create_android_fdt;
+use arch::apply_device_tree_overlays;
+use arch::DtbOverlay;
 use cros_fdt::Error;
-use cros_fdt::FdtWriter;
+use cros_fdt::Fdt;
 
 use crate::SetupData;
 use crate::SetupDataType;
@@ -21,13 +25,21 @@ use crate::SetupDataType;
 pub fn create_fdt(
     android_fstab: File,
     dump_device_tree_blob: Option<PathBuf>,
+    device_tree_overlays: Vec<DtbOverlay>,
 ) -> Result<SetupData, Error> {
-    let mut fdt = FdtWriter::new(&[]);
-
+    let mut fdt = Fdt::new(&[]);
     // The whole thing is put into one giant node with some top level properties
-    let root_node = fdt.begin_node("")?;
     create_android_fdt(&mut fdt, android_fstab)?;
-    fdt.end_node(root_node)?;
+
+    // Done writing base FDT, now apply DT overlays
+    apply_device_tree_overlays(
+        &mut fdt,
+        device_tree_overlays,
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        vec![],
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        &BTreeMap::new(),
+    )?;
 
     let fdt_final = fdt.finish()?;
 

@@ -3,8 +3,6 @@
 
 //! Windows specific code that keeps rest of the code in the crate platform independent.
 
-use std::sync::Arc;
-
 use base::AsRawDescriptor;
 use base::CloseNotifier;
 use base::ReadNotifier;
@@ -17,11 +15,13 @@ use crate::VhostUserMasterReqHandler;
 impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
     /// Create a `MasterReqHandler` that uses a Tube internally. Must specify the backend process
     /// which will receive the Tube.
-    pub fn with_tube(backend: Arc<S>, backend_pid: u32) -> Result<Self> {
+    pub fn with_tube(backend: S, backend_pid: u32) -> Result<Self> {
         Self::new(
             backend,
-            Box::new(move |tube| unsafe {
+            Box::new(move |tube|
+                // SAFETY:
                 // Safe because we expect the tube to be unpacked in the other process.
+                unsafe {
                 packed_tube::pack(tube, backend_pid).expect("packed tube")
             }),
         )
@@ -31,21 +31,19 @@ impl<S: VhostUserMasterReqHandler> MasterReqHandler<S> {
 impl<S: VhostUserMasterReqHandler> ReadNotifier for MasterReqHandler<S> {
     /// Used for polling.
     fn get_read_notifier(&self) -> &dyn AsRawDescriptor {
-        self.sub_sock.get_tube().get_read_notifier()
+        self.sub_sock.0.get_tube().get_read_notifier()
     }
 }
 
 impl<S: VhostUserMasterReqHandler> CloseNotifier for MasterReqHandler<S> {
     /// Used for closing.
     fn get_close_notifier(&self) -> &dyn AsRawDescriptor {
-        self.sub_sock.get_tube().get_close_notifier()
+        self.sub_sock.0.get_tube().get_close_notifier()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use base::AsRawDescriptor;
     use base::Descriptor;
     use base::INVALID_DESCRIPTOR;
@@ -53,13 +51,12 @@ mod tests {
     use super::*;
     use crate::message::VhostUserFSSlaveMsg;
     use crate::HandlerResult;
-    #[cfg(feature = "device")]
     use crate::Slave;
-    use crate::VhostUserMasterReqHandlerMut;
+    use crate::VhostUserMasterReqHandler;
 
     struct MockMasterReqHandler {}
 
-    impl VhostUserMasterReqHandlerMut for MockMasterReqHandler {
+    impl VhostUserMasterReqHandler for MockMasterReqHandler {
         /// Handle virtio-fs map file requests from the slave.
         fn fs_slave_map(
             &mut self,
@@ -77,24 +74,24 @@ mod tests {
 
     #[test]
     fn test_new_master_req_handler() {
-        let backend = Arc::new(Mutex::new(MockMasterReqHandler {}));
+        let backend = MockMasterReqHandler {};
         let handler = MasterReqHandler::with_tube(backend, std::process::id()).unwrap();
 
         assert!(handler.get_read_notifier().as_raw_descriptor() != INVALID_DESCRIPTOR);
         assert!(handler.get_close_notifier().as_raw_descriptor() != INVALID_DESCRIPTOR);
     }
 
-    #[cfg(feature = "device")]
     #[test]
     fn test_master_slave_req_handler() {
-        let backend = Arc::new(Mutex::new(MockMasterReqHandler {}));
+        let backend = MockMasterReqHandler {};
         let mut handler = MasterReqHandler::with_tube(backend, std::process::id()).unwrap();
 
         let event = base::Event::new().unwrap();
         let tx_descriptor = handler.take_tx_descriptor();
+        // SAFETY:
         // Safe because we only do it once.
         let stream = unsafe { packed_tube::unpack(tx_descriptor).unwrap() };
-        let fs_cache = Slave::from_stream(stream);
+        let mut fs_cache = Slave::from_stream(stream);
 
         std::thread::spawn(move || {
             let res = handler.handle_request().unwrap();
@@ -115,18 +112,18 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(feature = "device")]
     #[test]
     fn test_master_slave_req_handler_with_ack() {
-        let backend = Arc::new(Mutex::new(MockMasterReqHandler {}));
+        let backend = MockMasterReqHandler {};
         let mut handler = MasterReqHandler::with_tube(backend, std::process::id()).unwrap();
         handler.set_reply_ack_flag(true);
 
         let event = base::Event::new().unwrap();
         let tx_descriptor = handler.take_tx_descriptor();
+        // SAFETY:
         // Safe because we only do it once.
         let stream = unsafe { packed_tube::unpack(tx_descriptor).unwrap() };
-        let fs_cache = Slave::from_stream(stream);
+        let mut fs_cache = Slave::from_stream(stream);
 
         std::thread::spawn(move || {
             let res = handler.handle_request().unwrap();

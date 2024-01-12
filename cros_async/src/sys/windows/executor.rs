@@ -18,6 +18,8 @@ use crate::AsyncResult;
 use crate::IntoAsync;
 use crate::IoSource;
 
+pub const DEFAULT_IO_CONCURRENCY: u32 = 1;
+
 /// An executor for scheduling tasks that poll futures to completion.
 ///
 /// All asynchronous operations must run within an executor, which is capable of spawning futures as
@@ -82,7 +84,7 @@ use crate::IoSource;
 ///     Ok(len)
 /// }
 ///
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # fn do_it() -> Result<(), Box<dyn Error>> {
 ///     let ex = Executor::new()?;
 ///
@@ -111,13 +113,14 @@ use crate::IoSource;
 ///
 /// #     Ok(())
 /// # }
-/// #[cfg(unix)]
+/// #[cfg(any(target_os = "android", target_os = "linux"))]
 /// # do_it().unwrap();
 /// ```
 
 #[derive(Clone)]
 pub enum Executor {
     Handle(Arc<RawExecutor<HandleReactor>>),
+    Overlapped(Arc<RawExecutor<HandleReactor>>),
 }
 
 /// An enum to express the kind of the backend of `Executor`
@@ -127,6 +130,7 @@ pub enum Executor {
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub enum ExecutorKind {
     Handle,
+    Overlapped,
 }
 
 /// If set, [`Executor::new()`] is created with `ExecutorKind` of `DEFAULT_EXECUTOR_KIND`.
@@ -195,6 +199,19 @@ impl Executor {
     pub fn with_executor_kind(kind: ExecutorKind) -> AsyncResult<Self> {
         match kind {
             ExecutorKind::Handle => Ok(Executor::Handle(RawExecutor::<HandleReactor>::new()?)),
+            ExecutorKind::Overlapped => {
+                Ok(Executor::Overlapped(RawExecutor::<HandleReactor>::new()?))
+            }
+        }
+    }
+
+    /// Create a new `Executor` of the given `ExecutorKind`.
+    pub fn with_kind_and_concurrency(kind: ExecutorKind, concurrency: u32) -> AsyncResult<Self> {
+        match kind {
+            ExecutorKind::Handle => Ok(Executor::Handle(RawExecutor::<HandleReactor>::new()?)),
+            ExecutorKind::Overlapped => Ok(Executor::Overlapped(
+                RawExecutor::<HandleReactor>::new_with(HandleReactor::new_with(concurrency)?)?,
+            )),
         }
     }
 
@@ -204,6 +221,20 @@ impl Executor {
     pub fn async_from<'a, F: IntoAsync + 'a>(&self, f: F) -> AsyncResult<IoSource<F>> {
         match self {
             Executor::Handle(ex) => ex.new_source(f),
+            Executor::Overlapped(ex) => ex.new_source(f),
+        }
+    }
+
+    /// Create a new overlapped `IoSource<F>` associated with `self`. Callers may then use the
+    /// If the executor is not overlapped, then Handle source is returned.
+    /// returned `IoSource` to directly start async operations without needing a separate reference
+    /// to the executor.
+    pub fn async_overlapped_from<'a, F: IntoAsync + 'a>(&self, f: F) -> AsyncResult<IoSource<F>> {
+        match self {
+            Executor::Handle(ex) => ex.new_source(f),
+            Executor::Overlapped(ex) => Ok(IoSource::Overlapped(super::OverlappedSource::new(
+                f, ex, false,
+            )?)),
         }
     }
 
@@ -260,6 +291,7 @@ impl Executor {
     {
         match self {
             Executor::Handle(ex) => TaskHandle::Handle(ex.spawn(f)),
+            Executor::Overlapped(ex) => TaskHandle::Handle(ex.spawn(f)),
         }
     }
 
@@ -297,6 +329,7 @@ impl Executor {
     {
         match self {
             Executor::Handle(ex) => TaskHandle::Handle(ex.spawn_local(f)),
+            Executor::Overlapped(ex) => TaskHandle::Handle(ex.spawn_local(f)),
         }
     }
 
@@ -367,6 +400,7 @@ impl Executor {
     pub fn run_until<F: Future>(&self, f: F) -> AsyncResult<F::Output> {
         match self {
             Executor::Handle(ex) => Ok(ex.run_until(f)?),
+            Executor::Overlapped(ex) => Ok(ex.run_until(f)?),
         }
     }
 }

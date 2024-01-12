@@ -17,6 +17,8 @@ pub use winapi::um::winioctl::FILE_ANY_ACCESS;
 pub use winapi::um::winioctl::METHOD_BUFFERED;
 
 use crate::descriptor::AsRawDescriptor;
+use crate::errno_result;
+use crate::Result;
 
 /// Raw macro to declare the expression that calculates an ioctl number
 #[macro_export]
@@ -27,11 +29,11 @@ macro_rules! device_io_control_expr {
     //  just use that for now. However, we may need to support more
     //  options later.
     ($dtype:expr, $code:expr) => {
-        $crate::platform::CTL_CODE(
+        $crate::windows::CTL_CODE(
             $dtype,
             $code,
-            $crate::platform::METHOD_BUFFERED,
-            $crate::platform::FILE_ANY_ACCESS,
+            $crate::windows::METHOD_BUFFERED,
+            $crate::windows::FILE_ANY_ACCESS,
         ) as ::std::os::raw::c_ulong
     };
 }
@@ -296,29 +298,28 @@ pub unsafe fn ioctl_with_mut_ptr<T>(
 pub unsafe fn device_io_control<F: AsRawDescriptor, T, T2>(
     descriptor: &F,
     nr: IoctlNr,
-    input: &T,
+    input: *const T,
     inputsize: u32,
-    output: &mut T2,
+    output: *mut T2,
     outputsize: u32,
-) -> c_int {
-    let mut byte_ret: c_ulong = 0;
-
+    byte_ret: &mut c_ulong,
+) -> Result<()> {
     let ret = DeviceIoControl(
         descriptor.as_raw_descriptor(),
         nr,
-        input as *const T as *mut c_void,
+        input as *mut c_void,
         inputsize,
-        output as *mut T2 as *mut c_void,
+        output as *mut c_void,
         outputsize,
-        &mut byte_ret,
+        byte_ret,
         null_mut(),
     );
 
     if ret == 1 {
-        return 0;
+        return Ok(());
     }
 
-    GetLastError() as i32
+    errno_result()
 }
 
 #[cfg(test)]
@@ -371,6 +372,7 @@ mod tests {
         f.sync_all().expect("Failed to sync all.");
 
         // read the compression status
+        // SAFETY: safe because return value is checked.
         let ecode = unsafe {
             super::super::ioctl::ioctl_with_mut_ref(&f, FSCTL_GET_COMPRESSION, &mut compressed)
         };
@@ -395,6 +397,7 @@ mod tests {
         //   https://github.com/rust-lang/rust/blob/master/src/libstd/sys/windows/fs.rs#L260
         //   For now I'm just going to leave this test as-is.
         //
+        // SAFETY: safe because return value is checked.
         let f = unsafe {
             File::from_raw_handle(CreateFileW(
                 to_u16s(file_path).unwrap().as_ptr(),
@@ -409,6 +412,7 @@ mod tests {
         };
 
         let ecode =
+            // SAFETY: safe because return value is checked.
             unsafe { super::super::ioctl::ioctl_with_ref(&f, FSCTL_SET_COMPRESSION, &compressed) };
 
         assert_eq!(ecode, 0);
@@ -417,6 +421,7 @@ mod tests {
         // is writing anything to the compressed pointer.
         compressed = 0;
 
+        // SAFETY: safe because return value is checked.
         let ecode = unsafe {
             super::super::ioctl::ioctl_with_mut_ref(&f, FSCTL_GET_COMPRESSION, &mut compressed)
         };
@@ -461,6 +466,7 @@ mod tests {
         //   https://github.com/rust-lang/rust/blob/master/src/libstd/sys/windows/fs.rs#L260
         //   For now I'm just going to leave this test as-is.
         //
+        // SAFETY: safe because return value is checked.
         let f = unsafe {
             File::from_raw_handle(CreateFileW(
                 to_u16s(file_path).unwrap().as_ptr(),
@@ -476,6 +482,7 @@ mod tests {
 
         // now we call ioctl_with_val, which isn't particularly any more helpful than
         // ioctl_with_ref except for the cases where the input is only a word long
+        // SAFETY: safe because return value is checked.
         let ecode = unsafe {
             super::super::ioctl::ioctl_with_val(&f, FSCTL_SET_COMPRESSION, compressed.into())
         };
@@ -486,6 +493,7 @@ mod tests {
         // is writing anything to the compressed pointer.
         compressed = 0;
 
+        // SAFETY: safe because return value is checked.
         let ecode = unsafe {
             super::super::ioctl::ioctl_with_mut_ref(&f, FSCTL_GET_COMPRESSION, &mut compressed)
         };

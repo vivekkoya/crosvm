@@ -26,20 +26,22 @@ use vmm_vhost::SlaveReqHandler;
 use vmm_vhost::VhostUserSlaveReqHandler;
 
 use crate::virtio::vhost::user::device::handler::DeviceRequestHandler;
-use crate::virtio::vhost::user::device::handler::VhostUserRegularOps;
 
 pub fn read_from_tube_transporter(
     raw_transport_tube: RawDescriptor,
 ) -> anyhow::Result<TubeTransferDataList> {
-    // Safe because we know that raw_transport_tube is valid (passed by inheritance), and that
-    // the blocking & framing modes are accurate because we create them ourselves in the broker.
-    let tube_transporter = TubeTransporterReader::create_tube_transporter_reader(unsafe {
-        PipeConnection::from_raw_descriptor(
-            raw_transport_tube,
-            FramingMode::Message,
-            BlockingMode::Wait,
-        )
-    });
+    let tube_transporter = TubeTransporterReader::create_tube_transporter_reader(
+        // SAFETY:
+        // Safe because we know that raw_transport_tube is valid (passed by inheritance), and that
+        // the blocking & framing modes are accurate because we create them ourselves in the broker.
+        unsafe {
+            PipeConnection::from_raw_descriptor(
+                raw_transport_tube,
+                FramingMode::Message,
+                BlockingMode::Wait,
+            )
+        },
+    );
 
     tube_transporter.read_tubes().map_err(anyhow::Error::msg)
 }
@@ -68,8 +70,7 @@ pub async fn run_handler(
     pin_mut!(close_event_fut);
     pin_mut!(exit_event_fut);
 
-    let mut pending_header: Option<(VhostUserMsgHeader<MasterReq>, Option<Vec<std::fs::File>>)> =
-        None;
+    let mut pending_header: Option<(VhostUserMsgHeader<MasterReq>, Vec<std::fs::File>)> = None;
     loop {
         select! {
             _read_res = read_event_fut => {
@@ -127,7 +128,7 @@ pub mod test_helpers {
     pub(crate) fn listen<S: VhostUserSlaveReqHandler>(
         dev_tube: Tube,
         handler: S,
-    ) -> SlaveReqHandler<S, vmm_vhost::connection::TubeEndpoint<MasterReq>> {
+    ) -> SlaveReqHandler<S> {
         SlaveReqHandler::from_stream(dev_tube, handler)
     }
 }

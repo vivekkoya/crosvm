@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use base::AsRawDescriptor;
 
-#[cfg(unix)]
-use crate::sys::unix::PollSource;
-#[cfg(unix)]
-use crate::sys::unix::UringSource;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use crate::sys::linux::PollSource;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use crate::sys::linux::UringSource;
 #[cfg(windows)]
 use crate::sys::windows::HandleSource;
 #[cfg(windows)]
@@ -21,9 +21,9 @@ use crate::MemRegion;
 /// Associates an IO object `F` with cros_async's runtime and exposes an API to perform async IO on
 /// that object's descriptor.
 pub enum IoSource<F: base::AsRawDescriptor> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     Uring(UringSource<F>),
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     Epoll(PollSource<F>),
     #[cfg(windows)]
     Handle(HandleSource<F>),
@@ -31,28 +31,7 @@ pub enum IoSource<F: base::AsRawDescriptor> {
     Overlapped(OverlappedSource<F>),
 }
 
-pub enum AllocateMode {
-    #[cfg(unix)]
-    Allocate,
-    PunchHole,
-    ZeroRange,
-}
-
-// This assume we always want KEEP_SIZE
-#[cfg(unix)]
-impl From<AllocateMode> for u32 {
-    fn from(value: AllocateMode) -> Self {
-        match value {
-            AllocateMode::Allocate => 0,
-            AllocateMode::PunchHole => {
-                (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u32
-            }
-            AllocateMode::ZeroRange => {
-                (libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE) as u32
-            }
-        }
-    }
-}
+static_assertions::assert_impl_all!(IoSource<std::fs::File>: Send, Sync);
 
 /// Invoke a method on the underlying source type and await the result.
 ///
@@ -60,9 +39,9 @@ impl From<AllocateMode> for u32 {
 macro_rules! await_on_inner {
     ($x:ident, $method:ident $(, $args:expr)*) => {
         match $x {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             IoSource::Uring(x) => UringSource::$method(x, $($args),*).await,
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             IoSource::Epoll(x) => PollSource::$method(x, $($args),*).await,
             #[cfg(windows)]
             IoSource::Handle(x) => HandleSource::$method(x, $($args),*).await,
@@ -78,9 +57,9 @@ macro_rules! await_on_inner {
 macro_rules! on_inner {
     ($x:ident, $method:ident $(, $args:expr)*) => {
         match $x {
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             IoSource::Uring(x) => UringSource::$method(x, $($args),*),
-            #[cfg(unix)]
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             IoSource::Epoll(x) => PollSource::$method(x, $($args),*),
             #[cfg(windows)]
             IoSource::Handle(x) => HandleSource::$method(x, $($args),*),
@@ -134,14 +113,14 @@ impl<F: AsRawDescriptor> IoSource<F> {
         await_on_inner!(self, write_from_mem, file_offset, mem, mem_offsets)
     }
 
-    /// See `fallocate(2)`. Note this op is synchronous when using the Polled backend.
-    pub async fn fallocate(
-        &self,
-        file_offset: u64,
-        len: u64,
-        mode: AllocateMode,
-    ) -> AsyncResult<()> {
-        await_on_inner!(self, fallocate, file_offset, len, mode)
+    /// Deallocates the given range of a file.
+    pub async fn punch_hole(&self, file_offset: u64, len: u64) -> AsyncResult<()> {
+        await_on_inner!(self, punch_hole, file_offset, len)
+    }
+
+    /// Fills the given range with zeroes.
+    pub async fn write_zeroes_at(&self, file_offset: u64, len: u64) -> AsyncResult<()> {
+        await_on_inner!(self, write_zeroes_at, file_offset, len)
     }
 
     /// Sync all completed write operations to the backing storage.
@@ -192,13 +171,13 @@ mod tests {
 
     use super::*;
     use crate::mem::VecIoWrapper;
-    #[cfg(unix)]
-    use crate::sys::unix::uring_executor::is_uring_stable;
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    use crate::sys::linux::uring_executor::is_uring_stable;
     use crate::Executor;
     use crate::ExecutorKind;
     use crate::MemRegion;
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     fn all_kinds() -> Vec<ExecutorKind> {
         let mut kinds = vec![ExecutorKind::Fd];
         if is_uring_stable() {

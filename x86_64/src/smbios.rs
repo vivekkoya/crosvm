@@ -9,10 +9,12 @@ use std::slice;
 use arch::SmbiosOptions;
 use remain::sorted;
 use thiserror::Error;
+use uuid::Uuid;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 #[sorted]
 #[derive(Error, Debug)]
@@ -68,6 +70,7 @@ const DEFAULT_SMBIOS_MANUFACTURER: &str = "ChromiumOS";
 const DEFAULT_SMBIOS_PRODUCT_NAME: &str = "crosvm";
 
 fn compute_checksum<T: Copy>(v: &T) -> u8 {
+    // SAFETY:
     // Safe because we are only reading the bytes within the size of the `T` reference `v`.
     let v_slice = unsafe { slice::from_raw_parts(v as *const T as *const u8, mem::size_of::<T>()) };
     let mut checksum: u8 = 0;
@@ -78,7 +81,7 @@ fn compute_checksum<T: Copy>(v: &T) -> u8 {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct Smbios23Intermediate {
     pub signature: [u8; 5usize],
     pub checksum: u8,
@@ -89,7 +92,7 @@ pub struct Smbios23Intermediate {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct Smbios23Entrypoint {
     pub signature: [u8; 4usize],
     pub checksum: u8,
@@ -103,7 +106,7 @@ pub struct Smbios23Entrypoint {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct Smbios30Entrypoint {
     pub signature: [u8; 5usize],
     pub checksum: u8,
@@ -118,7 +121,7 @@ pub struct Smbios30Entrypoint {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct SmbiosBiosInfo {
     pub typ: u8,
     pub length: u8,
@@ -134,7 +137,7 @@ pub struct SmbiosBiosInfo {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct SmbiosSysInfo {
     pub typ: u8,
     pub length: u8,
@@ -150,7 +153,7 @@ pub struct SmbiosSysInfo {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct SmbiosOemStrings {
     pub typ: u8,
     pub length: u8,
@@ -159,7 +162,7 @@ pub struct SmbiosOemStrings {
 }
 
 #[repr(C, packed)]
-#[derive(Default, Clone, Copy, FromBytes, AsBytes)]
+#[derive(Default, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
 pub struct SmbiosEndOfTable {
     pub typ: u8,
     pub length: u8,
@@ -243,6 +246,8 @@ pub fn setup_smbios(mem: &GuestMemory, options: &SmbiosOptions, bios_size: u64) 
             typ: SYSTEM_INFORMATION,
             length: mem::size_of::<SmbiosSysInfo>() as u8,
             handle,
+            // PC vendors consistently use little-endian ordering for reasons
+            uuid: options.uuid.unwrap_or(Uuid::nil()).to_bytes_le(),
             manufacturer: 1, // First string written in this section
             product_name: 2, // Second string written in this section
             serial_number: if options.serial_number.is_some() {

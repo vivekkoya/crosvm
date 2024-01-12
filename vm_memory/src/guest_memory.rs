@@ -8,7 +8,6 @@ use std::convert::AsRef;
 use std::convert::TryFrom;
 use std::fs::File;
 use std::io::Read;
-use std::io::Write;
 use std::marker::Send;
 use std::marker::Sync;
 use std::result;
@@ -19,15 +18,18 @@ use base::pagesize;
 use base::AsRawDescriptor;
 use base::AsRawDescriptors;
 use base::Error as SysError;
+use base::FileReadWriteVolatile;
 use base::MappedRegion;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::RawDescriptor;
 use base::SharedMemory;
+use base::VolatileMemory;
+use base::VolatileMemoryError;
+use base::VolatileSlice;
 use cros_async::mem;
 use cros_async::BackingMemory;
-use data_model::volatile_memory::*;
 use remain::sorted;
 use thiserror::Error;
 use zerocopy::AsBytes;
@@ -696,87 +698,10 @@ impl GuestMemory {
                     .map_err(Error::VolatileMemoryAccess)
             })
     }
-
-    /// Reads data from a file descriptor and writes it to guest memory.
-    ///
-    /// # Arguments
-    /// * `guest_addr` - Begin writing memory at this offset.
-    /// * `src` - Read from `src` to memory.
-    /// * `count` - Read `count` bytes from `src` to memory.
-    ///
-    /// # Examples
-    ///
-    /// * Read bytes from /dev/urandom
-    ///
-    /// ```
-    /// # use base::MemoryMapping;
-    /// # use vm_memory::{GuestAddress, GuestMemory};
-    /// # use std::fs::File;
-    /// # use std::path::Path;
-    /// # fn test_read_random() -> Result<u32, ()> {
-    /// #     let start_addr = GuestAddress(0x1000);
-    /// #     let gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
-    ///       let mut file = File::open(Path::new("/dev/urandom")).map_err(|_| ())?;
-    ///       let addr = GuestAddress(0x1010);
-    ///       gm.read_to_memory(addr, &mut file, 128).map_err(|_| ())?;
-    ///       let read_addr = addr.checked_add(8).ok_or(())?;
-    ///       let rand_val: u32 = gm.read_obj_from_addr(read_addr).map_err(|_| ())?;
-    /// #     Ok(rand_val)
-    /// # }
-    /// ```
-    pub fn read_to_memory<F: Read + AsRawDescriptor>(
-        &self,
-        guest_addr: GuestAddress,
-        src: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        let (mapping, offset, _) = self.find_region(guest_addr)?;
-        mapping
-            .read_to_memory(offset, src, count)
-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
-    }
-
-    /// Writes data from memory to a file descriptor.
-    ///
-    /// # Arguments
-    /// * `guest_addr` - Begin reading memory from this offset.
-    /// * `dst` - Write from memory to `dst`.
-    /// * `count` - Read `count` bytes from memory to `src`.
-    ///
-    /// # Examples
-    ///
-    /// * Write 128 bytes to /dev/null
-    ///
-    /// ```
-    /// # use base::MemoryMapping;
-    /// # use vm_memory::{GuestAddress, GuestMemory};
-    /// # use std::fs::File;
-    /// # use std::path::Path;
-    /// # fn test_write_null() -> Result<(), ()> {
-    /// #     let start_addr = GuestAddress(0x1000);
-    /// #     let gm = GuestMemory::new(&vec![(start_addr, 0x400)]).map_err(|_| ())?;
-    ///       let mut file = File::open(Path::new("/dev/null")).map_err(|_| ())?;
-    ///       let addr = GuestAddress(0x1010);
-    ///       gm.write_from_memory(addr, &mut file, 128).map_err(|_| ())?;
-    /// #     Ok(())
-    /// # }
-    /// ```
-    pub fn write_from_memory<F: Write + AsRawDescriptor>(
-        &self,
-        guest_addr: GuestAddress,
-        dst: &mut F,
-        count: usize,
-    ) -> Result<()> {
-        let (mapping, offset, _) = self.find_region(guest_addr)?;
-        mapping
-            .write_from_memory(offset, dst, count)
-            .map_err(|e| Error::MemoryAccess(guest_addr, e))
-    }
-
     /// Convert a GuestAddress into a pointer in the address space of this
     /// process. This should only be necessary for giving addresses to the
     /// kernel, as with vhost ioctls. Normal reads/writes to guest memory should
-    /// be done through `write_from_memory`, `read_obj_from_addr`, etc.
+    /// be done through `write_obj_at_addr`, `read_obj_from_addr`, etc.
     ///
     /// # Arguments
     /// * `guest_addr` - Guest address to convert.
@@ -795,9 +720,12 @@ impl GuestMemory {
     /// ```
     pub fn get_host_address(&self, guest_addr: GuestAddress) -> Result<*const u8> {
         let (mapping, offset, _) = self.find_region(guest_addr)?;
-        // This is safe; `find_region` already checks that offset is in
-        // bounds.
-        Ok(unsafe { mapping.as_ptr().add(offset) } as *const u8)
+        Ok(
+            // SAFETY:
+            // This is safe; `find_region` already checks that offset is in
+            // bounds.
+            unsafe { mapping.as_ptr().add(offset) } as *const u8,
+        )
     }
 
     /// Convert a GuestAddress into a pointer in the address space of this
@@ -841,9 +769,12 @@ impl GuestMemory {
             return Err(Error::InvalidGuestAddress(guest_addr));
         }
 
-        // This is safe; `find_region` already checks that offset is in
-        // bounds.
-        Ok(unsafe { mapping.as_ptr().add(offset) } as *const u8)
+        Ok(
+            //SAFETY:
+            // This is safe; `find_region` already checks that offset is in
+            // bounds.
+            unsafe { mapping.as_ptr().add(offset) } as *const u8,
+        )
     }
 
     /// Returns a reference to the region that backs the given address.
@@ -936,7 +867,8 @@ impl GuestMemory {
             metadata
                 .regions
                 .push((region.guest_base.0, region.mapping.size()));
-            self.write_from_memory(region.guest_base, w, region.mapping.size())?;
+            let region_vslice = self.get_slice_at_addr(region.guest_base, region.mapping.size())?;
+            w.write_all_volatile(region_vslice)?;
         }
 
         Ok(serde_json::to_value(metadata)?)
@@ -969,7 +901,8 @@ impl GuestMemory {
         }
 
         for region in self.regions.iter() {
-            self.read_to_memory(region.guest_base, r, region.mapping.size())?;
+            let region_vslice = self.get_slice_at_addr(region.guest_base, region.mapping.size())?;
+            r.read_exact_volatile(region_vslice)?;
         }
 
         // Should always be at EOF at this point.
@@ -989,6 +922,7 @@ struct MemorySnapshotMetadata {
     regions: Vec<(u64, usize)>,
 }
 
+// SAFETY:
 // It is safe to implement BackingMemory because GuestMemory can be mutated any time already.
 unsafe impl BackingMemory for GuestMemory {
     fn get_volatile_slice(

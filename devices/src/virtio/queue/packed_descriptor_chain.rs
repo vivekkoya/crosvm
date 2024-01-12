@@ -18,6 +18,7 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::virtio::descriptor_chain::Descriptor;
 use crate::virtio::descriptor_chain::DescriptorAccess;
@@ -37,7 +38,7 @@ pub const RING_EVENT_FLAGS_DISABLE: u16 = 0x1;
 pub const RING_EVENT_FLAGS_DESC: u16 = 0x2;
 
 /// A packed virtio packed queue descriptor (`struct pvirtq_desc` in the spec).
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
 #[repr(C)]
 pub struct PackedDesc {
     /// Guest address of memory buffer address
@@ -82,7 +83,7 @@ impl PackedDesc {
     }
 }
 
-#[derive(Copy, Clone, Debug, FromBytes, AsBytes)]
+#[derive(Copy, Clone, Debug, FromZeroes, FromBytes, AsBytes)]
 #[repr(C)]
 pub struct PackedDescEvent {
     pub desc: Le16,
@@ -128,11 +129,6 @@ pub struct PackedDescriptorChain<'m> {
 
     queue_size: u16,
 
-    /// If `writable` is true, a writable descriptor has already been encountered.
-    /// Valid descriptor chains must consist of readable descriptors followed by writable
-    /// descriptors.
-    writable: bool,
-
     mem: &'m GuestMemory,
     desc_table: GuestAddress,
 }
@@ -158,7 +154,6 @@ impl<'m> PackedDescriptorChain<'m> {
             count: 0,
             id: None,
             queue_size,
-            writable: false,
             mem,
             desc_table,
             avail_wrap_counter,
@@ -221,12 +216,6 @@ impl DescriptorChainIter for PackedDescriptorChain<'_> {
         } else {
             DescriptorAccess::DeviceRead
         };
-
-        if access == DescriptorAccess::DeviceRead && self.writable {
-            bail!("invalid device-readable descriptor following writable descriptors");
-        } else if access == DescriptorAccess::DeviceWrite {
-            self.writable = true;
-        }
 
         // If VIRTQ_DESC_F_NEXT exists, the next descriptor in descriptor chain
         // is the next element in descriptor table. When index reaches the end of

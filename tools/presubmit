@@ -14,9 +14,7 @@ from impl.common import (
     argh,
     chdir,
     cmd,
-    is_kiwi_repo,
     run_main,
-    parallel,
 )
 from impl.presubmit import Check, CheckContext, run_checks, Group
 
@@ -27,7 +25,7 @@ mdformat = cmd("mdformat")
 lucicfg = cmd("third_party/depot_tools/lucicfg")
 
 # All supported platforms as a type and a list.
-Platform = Literal["x86_64", "aarch64", "mingw64", "armhf", "riscv64"]
+Platform = Literal["x86_64", "aarch64", "mingw64", "armhf"]
 PLATFORMS: Tuple[Platform, ...] = typing.get_args(Platform)
 
 
@@ -51,7 +49,8 @@ def platform_is_supported(platform: Platform):
 def check_python_tests(_: CheckContext):
     "Runs unit tests for python dev tooling."
     PYTHON_TESTS = [
-        "tests.cl_tests",
+        # Disabled due to b/309148074
+        # "tests.cl_tests",
         "impl.common",
     ]
     return [python.with_cwd(TOOLS_ROOT).with_args("-m", file) for file in PYTHON_TESTS]
@@ -86,16 +85,10 @@ def check_markdown_format(context: CheckContext):
 
 def check_rust_format(context: CheckContext):
     "Runs rustfmt on all modified files."
-    if context.nightly_fmt:
-        rustfmt = cmd(
-            cmd("rustup +nightly which rustfmt"),
-            "--config imports_granularity=item,group_imports=StdExternalCrate",
-        )
-    else:
-        rustfmt = cmd(cmd("rustup which rustfmt"))
+    rustfmt = cmd(cmd("rustup +nightly which rustfmt").stdout())
     # Windows doesn't accept very long arguments: https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa#:~:text=The%20maximum%20length%20of%20this%20string%20is%2032%2C767%20characters%2C%20including%20the%20Unicode%20terminating%20null%20character.%20If%20lpApplicationName%20is%20NULL%2C%20the%20module%20name%20portion%20of%20lpCommandLine%20is%20limited%20to%20MAX_PATH%20characters.
-    return parallel(
-        *rustfmt.with_color_flag()
+    return list(
+        rustfmt.with_color_flag()
         .with_args("--check" if not context.fix else "")
         .foreach(context.modified_files, batch_size=10)
     )
@@ -142,10 +135,7 @@ def check_crosvm_unit_tests(platform: Platform):
     def check(_: CheckContext):
         if not platform_is_supported(platform):
             return None
-        command = cmd("./tools/run_tests --verbose --platform", platform).with_color_flag()
-        if platform == "riscv64":
-            command = command.with_args("--no-default-features")
-        return command
+        return cmd("./tools/run_tests --verbose --platform", platform).with_color_flag()
 
     check.__doc__ = f"Runs crosvm unit tests for {platform}."
 
@@ -181,18 +171,6 @@ def check_clippy(platform: Platform):
     check.__doc__ = f"Runs clippy for {platform}."
 
     return check
-
-
-def check_infra_configs(context: CheckContext):
-    "Validate luci configs by sending them to luci-config."
-    # TODO: Validate config files. Requires authentication with luci inside docker.
-    return [lucicfg("fmt --dry-run", file) for file in context.modified_files]
-
-
-def check_infra_tests(_: CheckContext):
-    "Run recipe.py tests, all of them, regardless of which files were modified."
-    recipes = cmd("infra/recipes.py").with_path_env("third_party/depot_tools")
-    return recipes("test run")
 
 
 def custom_check(name: str, can_fix: bool = False):
@@ -354,27 +332,11 @@ CHECKS: List[Check] = [
             "**.min.js",
             "**.drawio",
             "**.json",
+            "**.dtb",
+            "**.dtbo",
         ],
     ),
 ]
-
-# We disable LUCI infra related tests because kokoro doesn't have internet connectivity that
-# the tests rely on.
-if not is_kiwi_repo():
-    CHECKS.extend(
-        [
-            Check(
-                check_infra_configs,
-                files=["infra/config/**.star"],
-                can_fix=True,
-            ),
-            Check(
-                check_infra_tests,
-                files=["infra/**.py"],
-                can_fix=True,
-            ),
-        ]
-    )
 
 ####################################################################################################
 # Group configuration
@@ -459,8 +421,7 @@ GROUPS: List[Group] = [
             "default_health_checks",
             "doc_tests",
             "python_tests",
-        ]
-        + (["infra_configs", "infra_tests"] if not is_kiwi_repo() else []),
+        ],
     ),
     *(
         Group(
@@ -518,7 +479,6 @@ def get_check_names_in_group(group: Group) -> Generator[str, None, None]:
 @argh.arg("--fix", default=False, help="Asks checks to fix problems where possible.")
 @argh.arg("--no-delta", default=False, help="Run on all files instead of just modified files.")
 @argh.arg("--no-parallel", default=False, help="Do not run checks in parallel.")
-@argh.arg("--nightly-fmt", default=False, help="Use nightly rust for rustfmt")
 @argh.arg(
     "checks_or_groups",
     help="List of checks or groups to run. Defaults to run the `default` group.",
@@ -528,7 +488,6 @@ def main(
     fix: bool = False,
     no_delta: bool = False,
     no_parallel: bool = False,
-    nightly_fmt: bool = False,
     *checks_or_groups: str,
 ):
     chdir(CROSVM_ROOT)
@@ -561,7 +520,6 @@ def main(
         check_list,
         fix=fix,
         run_on_all_files=no_delta,
-        nightly_fmt=nightly_fmt,
         parallel=not no_parallel,
     )
 

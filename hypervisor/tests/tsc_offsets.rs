@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 // TODO(b/237714823): Currently, only kvm is enabled for this test once LUCI can run windows.
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 #![cfg(target_arch = "x86_64")]
 
 use std::arch::x86_64::_rdtsc;
@@ -28,7 +28,7 @@ macro_rules! assert_wrapping_close {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 fn test_kvm_tsc_offsets() {
     use hypervisor::kvm::*;
     test_tsc_offsets(|guest_mem| {
@@ -113,6 +113,7 @@ where
     vcpu.set_sregs(&vcpu_sregs).expect("set sregs failed");
 
     // basic case, we set MSR to 0
+    // SAFETY: trivially safe
     let tsc_now = unsafe { _rdtsc() };
     test_tsc_offset_run(
         &mut vcpu,
@@ -124,9 +125,11 @@ where
         0,
     );
     // set offset to 0
+    // SAFETY: trivially safe
     let tsc_now = unsafe { _rdtsc() };
     test_tsc_offset_run(&mut vcpu, &mem_clone, load_addr, None, Some(0), 0, tsc_now);
     // some moderately sized offset
+    // SAFETY: trivially safe
     let tsc_now = unsafe { _rdtsc() };
     let ten_seconds = 2_500_000_000 * 10;
     test_tsc_offset_run(
@@ -139,6 +142,7 @@ where
         tsc_now + ten_seconds,
     );
     // set offset to u64::MAX - tsc_now + 1
+    // SAFETY: trivially safe
     let tsc_now = unsafe { _rdtsc() };
     test_tsc_offset_run(
         &mut vcpu,

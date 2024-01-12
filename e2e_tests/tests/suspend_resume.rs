@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#![cfg(unix)]
+#![cfg(any(target_os = "android", target_os = "linux"))]
 
 use std::io::Write;
 use std::path::Path;
@@ -167,13 +167,9 @@ fn snapshot_vhost_user() {
 
         let mut config = Config::new();
         config = config.with_stdout_hardware("legacy-virtio-console");
-        config = config.extra_args(vec![
-            "--vhost-user-blk".to_string(),
-            block_socket.path().to_str().unwrap().to_string(),
-            "--vhost-user-net".to_string(),
-            net_socket.path().to_str().unwrap().to_string(),
-            "--no-usb".to_string(),
-        ]);
+        config = config.with_vhost_user("block", block_socket.path());
+        config = config.with_vhost_user("net", net_socket.path());
+        config = config.extra_args(vec!["--no-usb".to_string()]);
         let mut vm = TestVm::new(config).unwrap();
 
         // suspend VM
@@ -190,11 +186,9 @@ fn snapshot_vhost_user() {
     let mut config = Config::new();
     // Start up VM with cold restore.
     config = config.with_stdout_hardware("legacy-virtio-console");
+    config = config.with_vhost_user("block", block_socket.path());
+    config = config.with_vhost_user("net", net_socket.path());
     config = config.extra_args(vec![
-        "--vhost-user-blk".to_string(),
-        block_socket.path().to_str().unwrap().to_string(),
-        "--vhost-user-net".to_string(),
-        net_socket.path().to_str().unwrap().to_string(),
         "--restore".to_string(),
         snap_path.to_str().unwrap().to_string(),
         "--no-usb".to_string(),

@@ -7,11 +7,11 @@
 use std::convert::TryInto;
 use std::fmt;
 
+use base::linux::MemoryMappingBuilderUnix;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
 use base::MemoryMappingArena;
 use base::MemoryMappingBuilder;
-use base::MemoryMappingBuilderUnix;
 use base::MmapError;
 use base::SafeDescriptor;
 use thiserror::Error as ThisError;
@@ -20,6 +20,7 @@ use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 use crate::virtio::resource_bridge;
 use crate::virtio::resource_bridge::ResourceBridgeError;
@@ -42,7 +43,7 @@ pub enum ResourceType {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, AsBytes, FromBytes)]
+#[derive(Clone, Copy, AsBytes, FromZeroes, FromBytes)]
 /// A guest resource entry which type is not decided yet.
 pub union UnresolvedResourceEntry {
     pub object: virtio_video_object_entry,
@@ -51,12 +52,16 @@ pub union UnresolvedResourceEntry {
 
 impl fmt::Debug for UnresolvedResourceEntry {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // Safe because `self.object` and `self.guest_mem` are the same size and both made of
-        // integers, making it safe to display them no matter their value.
         write!(
             f,
             "unresolved {:?} or {:?}",
+            // SAFETY:
+            // Safe because `self.object` and `self.guest_mem` are the same size and both made of
+            // integers, making it safe to display them no matter their value.
             unsafe { self.object },
+            // SAFETY:
+            // Safe because `self.object` and `self.guest_mem` are the same size and both made of
+            // integers, making it safe to display them no matter their value.
             unsafe { self.guest_mem }
         )
     }
@@ -229,6 +234,7 @@ impl GuestResource {
                     .map_err(GuestMemResourceCreationError::CantGetShmRegion)?;
                 let desc = base::clone_descriptor(guest_region)
                     .map_err(GuestMemResourceCreationError::DescriptorCloneError)?;
+                // SAFETY:
                 // Safe because we are the sole owner of the duplicated descriptor.
                 unsafe { SafeDescriptor::from_raw_descriptor(desc) }
             }
@@ -312,6 +318,7 @@ impl GuestResource {
         };
 
         let handle = GuestResourceHandle::VirtioObject(VirtioObjectHandle {
+            // SAFETY:
             // Safe because `buffer_info.file` is a valid file descriptor and we are stealing
             // it.
             desc: unsafe {
@@ -408,6 +415,7 @@ mod tests {
 
         // Create the `GuestMemHandle` we will try to map and retrieve the data from.
         let mem_handle = GuestResourceHandle::GuestPages(GuestMemHandle {
+            // SAFETY: descriptor is expected to be valid
             desc: unsafe {
                 SafeDescriptor::from_raw_descriptor(base::clone_descriptor(&mem).unwrap())
             },
@@ -424,6 +432,7 @@ mod tests {
         // that its u32s appear to increase linearly.
         let mapping = mem_handle.get_mapping(0, mem.size() as usize).unwrap();
         let mut data = vec![0u8; PAGE_SIZE * page_order.len()];
+        // SAFETY: src and dst are valid and aligned
         unsafe { std::ptr::copy_nonoverlapping(mapping.as_ptr(), data.as_mut_ptr(), data.len()) };
         for (index, chunk) in data.chunks_exact(U32_SIZE).enumerate() {
             let sized_chunk: &[u8; 4] = chunk.try_into().unwrap();

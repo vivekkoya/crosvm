@@ -6,6 +6,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+#[cfg(target_arch = "x86_64")]
+use base::error;
 use base::Event;
 use serde::Deserialize;
 use serde::Serialize;
@@ -14,6 +16,8 @@ use sync::Mutex;
 use super::INTERRUPT_STATUS_CONFIG_CHANGED;
 use super::INTERRUPT_STATUS_USED_RING;
 use super::VIRTIO_MSI_NO_VECTOR;
+#[cfg(target_arch = "x86_64")]
+use crate::acpi::PmWakeupEvent;
 use crate::irq_event::IrqEdgeEvent;
 use crate::irq_event::IrqLevelEvent;
 use crate::pci::MsixConfig;
@@ -25,15 +29,24 @@ struct TransportPci {
 }
 
 enum Transport {
-    Pci { pci: TransportPci },
-    Mmio { irq_evt_edge: IrqEdgeEvent },
-    VhostUser { call_evt: Event },
+    Pci {
+        pci: TransportPci,
+    },
+    Mmio {
+        irq_evt_edge: IrqEdgeEvent,
+    },
+    VhostUser {
+        call_evt: Event,
+        signal_config_changed_fn: Box<dyn Fn() + Send + Sync>,
+    },
 }
 
 struct InterruptInner {
     interrupt_status: AtomicUsize,
     transport: Transport,
     async_intr_status: bool,
+    #[cfg(target_arch = "x86_64")]
+    wakeup_event: Option<PmWakeupEvent>,
 }
 
 impl InterruptInner {
@@ -68,6 +81,12 @@ impl Interrupt {
     /// If MSI-X is enabled in this device, MSI-X interrupt is preferred.
     /// Write to the irqfd to VMM to deliver virtual interrupt to the guest
     pub fn signal(&self, vector: u16, interrupt_status_mask: u32) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(wakeup_event) = self.inner.wakeup_event.as_ref() {
+            if let Err(e) = wakeup_event.trigger_wakeup() {
+                error!("Wakeup trigger failed {:?}", e);
+            }
+        }
         match &self.inner.transport {
             Transport::Pci { pci } => {
                 // Don't need to set ISR for MSI-X interrupts
@@ -90,7 +109,7 @@ impl Interrupt {
                     irq_evt_edge.trigger().unwrap();
                 }
             }
-            Transport::VhostUser { call_evt } => {
+            Transport::VhostUser { call_evt, .. } => {
                 // TODO(b/187487351): To avoid sending unnecessary events, we might want to support
                 // interrupt status. For this purpose, we need a mechanism to share interrupt status
                 // between the vmm and the device process.
@@ -106,11 +125,18 @@ impl Interrupt {
 
     /// Notify the driver that the device configuration has changed.
     pub fn signal_config_changed(&self) {
-        let vector = match &self.inner.as_ref().transport {
-            Transport::Pci { pci } => pci.config_msix_vector,
-            _ => VIRTIO_MSI_NO_VECTOR,
-        };
-        self.signal(vector, INTERRUPT_STATUS_CONFIG_CHANGED)
+        match &self.inner.as_ref().transport {
+            Transport::Pci { pci } => {
+                self.signal(pci.config_msix_vector, INTERRUPT_STATUS_CONFIG_CHANGED)
+            }
+            Transport::Mmio { .. } => {
+                self.signal(VIRTIO_MSI_NO_VECTOR, INTERRUPT_STATUS_CONFIG_CHANGED)
+            }
+            Transport::VhostUser {
+                signal_config_changed_fn,
+                ..
+            } => signal_config_changed_fn(),
+        }
     }
 
     /// Get the event to signal resampling is needed if it exists.
@@ -138,6 +164,7 @@ impl Interrupt {
         irq_evt_lvl: IrqLevelEvent,
         msix_config: Option<Arc<Mutex<MsixConfig>>>,
         config_msix_vector: u16,
+        #[cfg(target_arch = "x86_64")] wakeup_event: Option<PmWakeupEvent>,
     ) -> Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
@@ -150,6 +177,8 @@ impl Interrupt {
                         config_msix_vector,
                     },
                 },
+                #[cfg(target_arch = "x86_64")]
+                wakeup_event,
             }),
         }
     }
@@ -162,6 +191,7 @@ impl Interrupt {
         msix_config: Option<Arc<Mutex<MsixConfig>>>,
         config_msix_vector: u16,
         snapshot: InterruptSnapshot,
+        #[cfg(target_arch = "x86_64")] wakeup_event: Option<PmWakeupEvent>,
     ) -> Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
@@ -174,6 +204,8 @@ impl Interrupt {
                         config_msix_vector,
                     },
                 },
+                #[cfg(target_arch = "x86_64")]
+                wakeup_event,
             }),
         }
     }
@@ -184,19 +216,41 @@ impl Interrupt {
                 interrupt_status: AtomicUsize::new(0),
                 transport: Transport::Mmio { irq_evt_edge },
                 async_intr_status,
+                #[cfg(target_arch = "x86_64")]
+                wakeup_event: None,
             }),
         }
     }
 
-    /// Create an `Interrupt` wrapping a vhost-user vring call event.
-    pub fn new_vhost_user(call_evt: Event) -> Interrupt {
+    /// Create an `Interrupt` wrapping a vhost-user vring call event and function that sends a
+    /// VHOST_USER_BACKEND_CONFIG_CHANGE_MSG to the frontend.
+    pub fn new_vhost_user(
+        call_evt: Event,
+        signal_config_changed_fn: Box<dyn Fn() + Send + Sync>,
+    ) -> Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
                 interrupt_status: AtomicUsize::new(0),
-                transport: Transport::VhostUser { call_evt },
+                transport: Transport::VhostUser {
+                    call_evt,
+                    signal_config_changed_fn,
+                },
                 async_intr_status: false,
+                #[cfg(target_arch = "x86_64")]
+                wakeup_event: None,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test() -> Interrupt {
+        Interrupt::new(
+            IrqLevelEvent::new().unwrap(),
+            None,
+            VIRTIO_MSI_NO_VECTOR,
+            #[cfg(target_arch = "x86_64")]
+            None,
+        )
     }
 
     /// Get a reference to the interrupt event.
@@ -204,7 +258,7 @@ impl Interrupt {
         match &self.inner.as_ref().transport {
             Transport::Pci { pci } => pci.irq_evt_lvl.get_trigger(),
             Transport::Mmio { irq_evt_edge } => irq_evt_edge.get_trigger(),
-            Transport::VhostUser { call_evt } => call_evt,
+            Transport::VhostUser { call_evt, .. } => call_evt,
         }
     }
 
@@ -248,6 +302,13 @@ impl Interrupt {
     pub fn snapshot(&self) -> InterruptSnapshot {
         InterruptSnapshot {
             interrupt_status: self.inner.interrupt_status.load(Ordering::SeqCst),
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_wakeup_event_active(&self, active: bool) {
+        if let Some(wakeup_event) = self.inner.wakeup_event.as_ref() {
+            wakeup_event.set_active(active);
         }
     }
 }

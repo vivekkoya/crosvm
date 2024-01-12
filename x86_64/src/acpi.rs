@@ -25,6 +25,7 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use zerocopy::AsBytes;
 use zerocopy::FromBytes;
+use zerocopy::FromZeroes;
 
 pub struct AcpiDevResource {
     pub amls: Vec<u8>,
@@ -35,7 +36,7 @@ pub struct AcpiDevResource {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
+#[derive(Clone, Copy, Default, FromZeroes, FromBytes, AsBytes)]
 struct GenericAddress {
     _space_id: u8,
     _bit_width: u8,
@@ -55,7 +56,7 @@ struct LocalApic {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
+#[derive(Clone, Copy, Default, FromZeroes, FromBytes, AsBytes)]
 struct Ioapic {
     _type: u8,
     _length: u8,
@@ -66,7 +67,7 @@ struct Ioapic {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
+#[derive(Clone, Copy, Default, FromZeroes, FromBytes, AsBytes)]
 struct IoapicInterruptSourceOverride {
     _type: u8,
     _length: u8,
@@ -77,7 +78,7 @@ struct IoapicInterruptSourceOverride {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, FromBytes, AsBytes)]
+#[derive(Clone, Copy, Default, FromZeroes, FromBytes, AsBytes)]
 struct Localx2Apic {
     _type: u8,
     _length: u8,
@@ -445,11 +446,13 @@ fn sync_acpi_id_from_cpuid(
             return Err(e);
         }
 
+        // SAFETY:
         // Safe because we pass 0 and 0 for this call and the host supports the
         // `cpuid` instruction
         let mut cpuid_entry: CpuidResult = unsafe { __cpuid_count(0, 0) };
 
         if cpuid_entry.eax >= 0xB {
+            // SAFETY:
             // Safe because we pass 0xB and 0 for this call and the host supports the
             // `cpuid` instruction
             cpuid_entry = unsafe { __cpuid_count(0xB, 0) };
@@ -487,6 +490,7 @@ fn sync_acpi_id_from_cpuid(
 
         if !has_leafb {
             if !get_apic_id {
+                // SAFETY:
                 // Safe because we pass 1 for this call and the host supports the
                 // `cpuid` instruction
                 cpuid_entry = unsafe { __cpuid(1) };

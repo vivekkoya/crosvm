@@ -13,10 +13,10 @@ use std::time::Duration;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
-use base::unix::getpid;
-use base::unix::kill;
-use base::unix::Pid;
-use base::unix::Signal;
+use base::linux::getpid;
+use base::linux::kill;
+use base::linux::Signal;
+use base::Pid;
 
 /// Stops all the crosvm device processes during moving the guest memory to the staging memory.
 ///
@@ -54,6 +54,7 @@ impl ProcessesGuard {
     /// Stops all the crosvm processes by sending SIGSTOP signal.
     fn stop_the_world(&self) -> Result<()> {
         for pid in &self.pids {
+            // SAFETY:
             // safe because pid in pids are crosvm processes except this monitor process.
             unsafe { kill(*pid, Signal::Stop as i32) }.context("failed to stop process")?;
         }
@@ -66,6 +67,7 @@ impl ProcessesGuard {
     /// Resumes all the crosvm processes by sending SIGCONT signal.
     fn continue_the_world(&self) {
         for pid in &self.pids {
+            // SAFETY:
             // safe because pid in pids are crosvm processes except this monitor process and
             // continue signal does not have side effects.
             // ignore the result because we don't care whether it succeeds.

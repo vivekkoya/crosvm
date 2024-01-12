@@ -12,6 +12,8 @@ use std::sync::mpsc::channel;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::TryRecvError;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use base::error;
@@ -204,6 +206,7 @@ impl Serial {
                         return rx;
                     }
                 };
+                let mut kill_timeout = None;
                 loop {
                     let events = match wait_ctx.wait() {
                         Ok(events) => events,
@@ -215,7 +218,27 @@ impl Serial {
                     for event in events.iter() {
                         match event.token {
                             Token::Kill => {
-                                return rx;
+                                // Ignore the kill event until there are no other events to process so that
+                                // we drain `rx` as much as possible. The next `wait_ctx.wait()` call will
+                                // immediately re-entry this case since we don't call `kill_evt.wait()`.
+                                if events.iter().all(|e| matches!(e.token, Token::Kill)) {
+                                    return rx;
+                                }
+                                const TIMEOUT_DURATION: Duration = Duration::from_millis(500);
+                                match kill_timeout {
+                                    None => {
+                                        kill_timeout = Some(Instant::now() + TIMEOUT_DURATION);
+                                    }
+                                    Some(t) => {
+                                        if Instant::now() >= t {
+                                            error!(
+                                                "failed to drain serial input within {:?}, giving up",
+                                                TIMEOUT_DURATION
+                                            );
+                                            return rx;
+                                        }
+                                    }
+                                }
                             }
                             Token::SerialEvent => {
                                 // Matches both is_readable and is_hungup.
@@ -517,7 +540,12 @@ struct SerialSnapshot {
 }
 
 impl Suspendable for Serial {
-    fn snapshot(&self) -> anyhow::Result<serde_json::Value> {
+    fn snapshot(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.spawn_input_thread();
+        if let Some(worker) = self.worker.take() {
+            self.input = Some(worker.stop());
+        }
+        self.drain_in_channel();
         let snap = SerialSnapshot {
             interrupt_enable: self.interrupt_enable.load(Ordering::SeqCst),
             interrupt_identification: self.interrupt_identification,
@@ -592,6 +620,7 @@ mod tests {
     use sync::Mutex;
 
     use super::*;
+    use crate::serial_device::SerialOptions;
     use crate::suspendable_tests;
     pub use crate::sys::serial_device::SerialDevice;
 
@@ -644,7 +673,7 @@ mod tests {
             None,
             Some(Box::new(serial_out.clone())),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -665,7 +694,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -693,7 +722,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -742,7 +771,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -781,7 +810,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -828,7 +857,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -864,7 +893,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -888,7 +917,7 @@ mod tests {
             None,
             Some(Box::new(serial_out)),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         );
 
@@ -928,7 +957,7 @@ mod tests {
             None,
             Some(Box::new(SharedBuffer::new())),
             None,
-            false,
+            Default::default(),
             Vec::new(),
         ),
         modify_device
@@ -961,7 +990,10 @@ mod tests {
             None,
             Some(Box::new(serial_out.clone())),
             None,
-            true,
+            SerialOptions {
+                out_timestamp: true,
+                ..Default::default()
+            },
             Vec::new(),
         );
 

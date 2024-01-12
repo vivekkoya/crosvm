@@ -2,13 +2,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(unix)]
+#[cfg(any(target_os = "android", target_os = "linux"))]
 mod test {
     use std::thread;
     use std::time::Duration;
 
     use base::getpid;
-    use base::unix::process::fork_process;
+    use base::linux::process::fork_process;
     use base::AsRawDescriptor;
     use base::Tube;
     use minijail::Minijail;
@@ -52,6 +52,7 @@ mod test {
 
         assert_eq!(thread_comm, thread_name + "\n");
 
+        // SAFETY: child pid is expected to be valid and we wait on the child
         unsafe { libc::kill(child.pid, libc::SIGKILL) };
         child.wait().unwrap();
     }
@@ -75,6 +76,7 @@ mod test {
 
         assert_eq!(thread_comm, "123456789012345\n");
 
+        // SAFETY: child pid is expected to be valid and we wait on the child
         unsafe { libc::kill(child.pid, libc::SIGKILL) };
         child.wait().unwrap();
     }
@@ -108,27 +110,27 @@ fn main() {
     };
 
     let tests = vec![
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         libtest_mimic::Trial::test("pid_diff", move || {
             test::pid_diff();
             Ok(())
         }),
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         libtest_mimic::Trial::test("thread_name", move || {
             test::thread_name();
             Ok(())
         }),
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         libtest_mimic::Trial::test("thread_name_trimmed", move || {
             test::thread_name_trimmed();
             Ok(())
         }),
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         libtest_mimic::Trial::test("wait_for_success", move || {
             test::wait_for_success();
             Ok(())
         }),
-        #[cfg(unix)]
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         libtest_mimic::Trial::test("wait_for_panic", move || {
             test::wait_for_panic();
             Ok(())
